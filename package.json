@@ -1,0 +1,38 @@
+{
+  "name": "burnlint",
+  "version": "0.1.0",
+  "description": "Lint agent traces for wasted tokens and money. Works on Claude Code logs and any OpenTelemetry GenAI trace.",
+  "type": "module",
+  "bin": {
+    "burnlint": "dist/cli.js"
+  },
+  "files": [
+    "dist/cli.js",
+    "dist/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "update-prices": "node scripts/update-prices.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "llm",
+    "agents",
+    "opentelemetry",
+    "gen_ai",
+    "claude-code",
+    "token",
+    "cost",
+    "lint"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.19.1",
+    "typescript": "^5.9.3"
+  }
+}
