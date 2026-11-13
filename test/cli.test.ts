@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { tmpFile } from "./helpers.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const cli = join(root, "dist", "cli.js");
@@ -32,4 +33,40 @@ test("json output parses", () => {
 test("bad input exits 2", () => {
   assert.equal(run("audit", "/nope").status, 2);
   assert.equal(run("audit", fixture, "--fail-on", "maybe").status, 2);
+});
+
+test("a mistyped option is refused, not ignored", () => {
+  const rule = run("audit", fixture, "--rule", "reread-unchange", "--fail-on", "low");
+  assert.equal(rule.status, 2);
+  assert.match(rule.stderr, /unknown rule: reread-unchange .*reread-unchanged/);
+  assert.equal(run("audit", fixture, "--rule", "reread-unchanged", "--fail-on", "low").status, 1);
+
+  for (const bad of ["abc", "", "-1", "Infinity"]) assert.equal(run("audit", fixture, "--high-usd", bad).status, 2, bad);
+  assert.equal(run("audit", fixture, "--medium-usd", "abc").status, 2);
+  assert.match(run("audit", fixture, "--medium-usd", "5").stderr, /must not be above --high-usd/);
+  assert.equal(run("audit", fixture, "--high-usd", "0.0001", "--medium-usd", "0.0001", "--fail-on", "high").status, 1);
+
+  assert.equal(run("audit", fixture, "-f", "yaml").status, 2);
+  assert.match(run("audit", fixture, "--out", "x.jsonl").stderr, /audit does not take --out/);
+  assert.match(run("record", "--fail-on", "low").stderr, /record does not take --fail-on/);
+  assert.match(run("rules", "-v").stderr, /rules does not take --verbose/);
+});
+
+test("--prices rejects a file that would be silently ignored", () => {
+  const prices = (content: string) => run("audit", fixture, "--prices", tmpFile("prices.json", content));
+  assert.equal(prices(JSON.stringify({ "deepseek-chat": { input: 1, output: 2, cacheRead: null } })).status, 0);
+  assert.match(prices("{oops").stderr, /--prices .*prices\.json/);
+  assert.match(prices(JSON.stringify({ "deepseek-chat": { cache_read: 0.1 } })).stderr, /unknown field "cache_read"/);
+  assert.match(prices(JSON.stringify({ "deepseek-chat": { input: "1.25" } })).stderr, /must be a number/);
+  assert.equal(prices(JSON.stringify([1])).status, 2);
+});
+
+test("nothing to audit is an error, not a pass", () => {
+  const junk = run("audit", tmpFile("junk.json", JSON.stringify({ a: 1 })), "--fail-on", "low");
+  assert.equal(junk.status, 2);
+  assert.match(junk.stderr, /no agent runs found.*1 file\(s\) could not be read/);
+  // Still a well-formed report on stdout for whoever parses it.
+  const asJson = run("audit", tmpFile("junk.json", JSON.stringify({ a: 1 })), "-f", "json");
+  assert.equal(asJson.status, 2);
+  assert.equal(JSON.parse(asJson.stdout).runs.length, 0);
 });

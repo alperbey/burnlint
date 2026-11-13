@@ -15,6 +15,7 @@ Everything runs locally. No network calls, and message content is never printed.
 npx burnlint audit                      # your Claude Code history
 npx burnlint audit traces.json          # an OTLP/JSON export
 npx burnlint audit ./traces --fail-on high -f md   # CI, Markdown for PR comments
+npx burnlint record -o run.jsonl        # capture OTLP traces from a running agent
 ```
 
 ## Example
@@ -41,15 +42,49 @@ Notes
   - 3 call(s) report no cache usage; their cost is an upper bound (cached tokens priced at full rate)
 ```
 
+## Recording a running agent
+
+`burnlint record` is a local OTLP/HTTP receiver. It saves the traces an agent exports so they can be audited, without a collector or a tracing backend.
+
+```
+burnlint record -o run.jsonl
+```
+
+In another terminal, run the agent with its OpenTelemetry export pointed at the recorder:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/json \
+  your-agent ...
+```
+
+Stop the recorder with Ctrl-C, then `burnlint audit run.jsonl`.
+
+- **JSON encoding only for now.** Many SDKs and CLIs export protobuf unless told otherwise, hence `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`. A protobuf export is refused with HTTP 415 and counted in the summary; nothing is dropped silently. Gzip-compressed JSON is accepted.
+- It listens on `127.0.0.1` only (port 4318, change with `--port`) and forwards nothing.
+- Each trace export becomes one line of the output file, written as received. Recording to an existing trace file appends to it.
+- The file holds whatever the agent exports. With content capture turned on in the agent that includes prompts and tool results, so it is created readable by your user only (mode 0600). burnlint never prints that content.
+- Only traces are kept. Log and metric exports are accepted and discarded, and the summary says how many.
+- The agent still has to have telemetry switched on. How to do that differs per agent and is not something `record` can do for it.
+
 ## Rules
 
 | Rule | Flags | Estimated cost |
 |---|---|---|
-| `duplicate-tool-call` | Same tool, identical input, nothing written in between, earlier call didn't fail | Repeated result tokens, carried through the rest of the run |
-| `reread-unchanged` | Same file and range read again with no write to it (or shell command) in between | Same |
+| `duplicate-tool-call` | Same tool, identical input and identical result, nothing written and no shell command in between, earlier call didn't fail | Repeated result tokens, carried through the rest of the run |
+| `reread-unchanged` | Same file and range read again, same content returned, with no write to it (under any spelling of the path) and no shell command in between | Same |
 | `cache-thrash` | A turn after the first that writes more to the prompt cache than it reads, above 20k tokens | Rewritten tokens at the write rate minus the read rate |
 
-Repeat detection resets when a new human message arrives, since the person may have changed things outside the agent.
+The repeat rules stay silent when the trace can't show that a call was redundant:
+
+- A new human message resets them, since the person may have changed things outside the agent.
+- Shell commands are never reported as duplicates. Their output depends on state the trace doesn't show, and anything read before one may have changed.
+- A call that returned something different from last time learned something, so it is not a repeat. `duplicate-tool-call` needs the results in the trace for this; without them it reports nothing.
+- Tools that poll by name (`get_job_status`, `wait_for_…`, `ping`) and reads of URLs are not treated as repeats.
+
+Findings name the tool and the turns, or the file path. They never include tool inputs such as queries or commands.
+
+Exit codes: `0` audited, `1` a finding at or above `--fail-on`, `2` bad options or nothing to audit (no agent runs found in the given paths).
 
 Severity is set by cost: `high` from $1, `medium` from $0.10 (change with `--high-usd` / `--medium-usd`).
 
@@ -76,7 +111,7 @@ Read directly. Handled quirks:
 
 ### OpenTelemetry GenAI (OTLP/JSON)
 
-Accepts a single export request, an array of them, or JSONL with one per line (the OTel Collector file exporter format).
+Accepts a single export request, an array of them, or JSONL with one per line (the OTel Collector file exporter format, and what `burnlint record` writes).
 
 - Model calls: spans with `gen_ai.operation.name` of `chat`, `generate_content`, `text_completion`, or carrying `gen_ai.usage.*`. Parent spans that only sum their children's usage are skipped.
 - Tool calls: `execute_tool` spans. Duplicate and reread rules need `gen_ai.tool.call.arguments`, which most instrumentations only record with content capture turned on.
@@ -90,12 +125,12 @@ Accepts a single export request, an array of them, or JSONL with one per line (t
 
 ## Status
 
-v0.1. Working: Claude Code logs, gen_ai OTLP, three rules, table / JSON / Markdown output.
+v0.1. Working: Claude Code logs, gen_ai OTLP, three rules, table / JSON / Markdown output, `record` for OTLP/HTTP JSON.
 
 Next:
 
 - More rules: `oversized-tool-result`, `retry-loop`, `context-growth`
-- `burnlint record`: a local OTLP receiver, so any OTel-capable agent can be audited with one environment variable
+- Protobuf in `burnlint record`, so agents that cannot switch to `http/json` can be recorded too
 - Dialect mappers checked against real exports: Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans, OpenInference, Vercel AI SDK
 - `burnlint diff` for comparing a branch against a baseline in CI
 
@@ -105,6 +140,8 @@ Next:
 npm install
 npm test
 ```
+
+`scripts/gen-record-fixture.mjs` regenerates the `record` fixture by sending spans through the official OpenTelemetry JS OTLP exporter to a running `burnlint record` (package versions are pinned in the script).
 
 `scripts/gen-otel-deepseek-fixture.py` regenerates the OTel fixture by running the official `opentelemetry-instrumentation-openai-v2` against a local mock DeepSeek server (needs `openai`, `opentelemetry-sdk`, `opentelemetry-instrumentation-openai-v2==2.3b0`, `opentelemetry-exporter-otlp-proto-common`, `wrapt<2`).
 
