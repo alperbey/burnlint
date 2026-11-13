@@ -234,6 +234,11 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
     return { index, call, tools: [] };
   });
 
+  // A prompt that shrinks means the context was replaced: a new conversation in
+  // the same trace (a second agent call, a sub-agent, history dropped or
+  // summarized). Results from before it are not in the model's context any more.
+  const resets = markContextResets(turns);
+
   // Attach each tool span to the latest model call that started before it.
   let orphanTools = 0;
   for (const s of list.filter(isTool)) {
@@ -258,6 +263,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
   if (noUsage) notes.push(`${noUsage} model call(s) have no usage data (not priced)`);
   if (failed) notes.push(`${failed} model call(s) failed with an error status (not priced)`);
   if (aggregates) notes.push(`${aggregates} aggregate span(s) skipped to avoid double counting`);
+  if (resets) notes.push(`${resets} context reset(s): the prompt shrank, so repeat and cache rules start over there`);
   if (orphanTools) notes.push(`${orphanTools} tool span(s) started before any model call`);
 
   const service = list.find((s) => s.service)?.service;
@@ -270,6 +276,32 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
     turns,
     notes,
   };
+}
+
+/** Whole prompt of a call: uncached input plus cache reads and writes. null when unknown. */
+function promptTokens(t: ModelCall["tokens"]): number | null {
+  if (!t || t.input == null) return null;
+  return t.input + (t.cacheRead ?? 0) + (t.cacheWriteOther ?? 0) + (t.cacheWrite5m ?? 0) + (t.cacheWrite1h ?? 0);
+}
+
+/**
+ * In one conversation the prompt only grows. A call whose prompt is under 80%
+ * of the previous known prompt, and at least 1,024 tokens smaller, starts a new
+ * context. Calls without usage are skipped over.
+ */
+function markContextResets(turns: Turn[]): number {
+  let prev: number | null = null;
+  let resets = 0;
+  for (const t of turns) {
+    const p = promptTokens(t.call.tokens);
+    if (p == null) continue;
+    if (prev != null && p < prev * 0.8 && prev - p >= 1024) {
+      t.contextReplacedBefore = true;
+      resets++;
+    }
+    prev = p;
+  }
+  return resets;
 }
 
 function toolFromSpan(s: Span): ToolCall {

@@ -67,7 +67,8 @@ export interface Turn {
    */
   humanInputBefore?: boolean;
   /**
-   * True when the context was replaced just before this call (compaction).
+   * True when the context was replaced just before this call: compaction, or
+   * (OTLP) a prompt that shrank, as when a trace holds a second conversation.
    * Earlier tool results are gone from context and the prompt cache has to be
    * rebuilt, so neither a re-read nor a full cache write is waste.
    */
