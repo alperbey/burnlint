@@ -15,6 +15,8 @@ export interface RunSummary {
   project?: string;
   calls: number;
   pricedCalls: number;
+  /** Calls that returned an error (not priced). */
+  failedCalls: number;
   costUsd: number;
   unpricedModels: string[];
   notes: string[];
@@ -33,8 +35,10 @@ export interface AuditResult {
   findingsCostUsd: number;
   /** What no-loss fixes would have saved, net of their own cost. Trade-offs are not counted. */
   avoidableUsd: number;
-  /** Cost per unit of work. null when nothing was audited. */
+  /** Cost per unit of work, over runs with at least one priced call. null when there are none. */
   perRun: PerRun | null;
+  /** Runs left out of `perRun` because none of their calls could be priced. */
+  excludedRuns: { failed: number; unpriced: number };
   /** Spend and avoidable spend at a stated volume. Only when one was given. */
   projection?: Projection;
   prices: { source: string; retrieved: string };
@@ -55,7 +59,7 @@ export interface PerRun {
   avoidableUsd: number;
   /** Avoidable spend as a share of all spend, 0-1. */
   avoidableShare: number;
-  /** Runs with calls that couldn't be priced: their cost is a lower bound. */
+  /** Counted runs with calls that couldn't be priced (failed or no usage): their cost is a lower bound. */
   incomplete: number;
 }
 
@@ -137,12 +141,15 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
     for (const run of runs) {
       let cost = 0;
       let priced = 0;
+      let failed = 0;
       const unpriced = new Set<string>();
       for (const t of run.turns) {
         const c = callCost(t.call, prices);
         if (c != null) {
           cost += c;
           priced++;
+        } else if (t.call.failed) {
+          failed++;
         } else if (t.call.tokens && t.call.model) {
           unpriced.add(t.call.model);
         }
@@ -156,6 +163,7 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
         project: run.project,
         calls: run.turns.length,
         pricedCalls: priced,
+        failedCalls: failed,
         costUsd: cost,
         unpricedModels: [...unpriced],
         notes: run.notes,
@@ -173,7 +181,7 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
 
   const totalCostUsd = summaries.reduce((s, r) => s + r.costUsd, 0);
   const avoidableUsd = findings.reduce((s, f) => s + (f.avoidableUsd ?? 0), 0);
-  const perRun = perRunCosts(summaries, totalCostUsd, avoidableUsd);
+  const { perRun, excludedRuns } = perRunCosts(summaries, totalCostUsd, avoidableUsd);
   const n = opts.runsPerMonth;
   return {
     files: files.length,
@@ -185,6 +193,7 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
     findingsCostUsd: findings.reduce((s, f) => s + (f.costUsd ?? 0), 0),
     avoidableUsd,
     perRun,
+    excludedRuns,
     ...(n != null && perRun ? { projection: { runsPerMonth: n, spendUsd: perRun.meanUsd * n, avoidableUsd: perRun.avoidableUsd * n } } : {}),
     prices: { source: prices.source, retrieved: prices.retrieved },
   };
@@ -193,26 +202,44 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
 /** The unit a run summary belongs to: its session (sub-agents share their parent's), else itself. */
 export const unitOf = (r: RunSummary) => r.session ?? r.id;
 
-function perRunCosts(summaries: RunSummary[], total: number, avoidable: number): PerRun | null {
-  const units = new Map<string, { cost: number; incomplete: boolean }>();
+/**
+ * Runs with no priced call are left out: a run that failed before its first
+ * answer would otherwise count as a $0 run and pull the median down. They are
+ * counted separately, as failed (a call returned an error) or unpriced.
+ */
+function perRunCosts(
+  summaries: RunSummary[],
+  total: number,
+  avoidable: number,
+): { perRun: PerRun | null; excludedRuns: AuditResult["excludedRuns"] } {
+  const units = new Map<string, { cost: number; calls: number; priced: number; failed: number }>();
   for (const r of summaries) {
-    const u = units.get(unitOf(r)) ?? { cost: 0, incomplete: false };
+    const u = units.get(unitOf(r)) ?? { cost: 0, calls: 0, priced: 0, failed: 0 };
     u.cost += r.costUsd;
-    u.incomplete ||= r.pricedCalls < r.calls;
+    u.calls += r.calls;
+    u.priced += r.pricedCalls;
+    u.failed += r.failedCalls;
     units.set(unitOf(r), u);
   }
-  if (!units.size) return null;
-  const costs = [...units.values()].map((u) => u.cost).sort((a, b) => a - b);
+  const all = [...units.values()];
+  const counted = all.filter((u) => u.priced > 0);
+  const excluded = all.filter((u) => u.priced === 0);
+  const excludedRuns = { failed: excluded.filter((u) => u.failed > 0).length, unpriced: excluded.filter((u) => u.failed === 0).length };
+  if (!counted.length) return { perRun: null, excludedRuns };
+  const costs = counted.map((u) => u.cost).sort((a, b) => a - b);
   const count = costs.length;
   const mid = count >> 1;
   return {
-    count,
-    meanUsd: total / count,
-    medianUsd: count % 2 ? costs[mid]! : (costs[mid - 1]! + costs[mid]!) / 2,
-    p90Usd: costs[Math.ceil(0.9 * count) - 1]!,
-    maxUsd: costs[count - 1]!,
-    avoidableUsd: avoidable / count,
-    avoidableShare: total > 0 ? avoidable / total : 0,
-    incomplete: [...units.values()].filter((u) => u.incomplete).length,
+    perRun: {
+      count,
+      meanUsd: total / count,
+      medianUsd: count % 2 ? costs[mid]! : (costs[mid - 1]! + costs[mid]!) / 2,
+      p90Usd: costs[Math.ceil(0.9 * count) - 1]!,
+      maxUsd: costs[count - 1]!,
+      avoidableUsd: avoidable / count,
+      avoidableShare: total > 0 ? avoidable / total : 0,
+      incomplete: counted.filter((u) => u.priced < u.calls).length,
+    },
+    excludedRuns,
   };
 }

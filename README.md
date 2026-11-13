@@ -36,7 +36,7 @@ myproject 3f2a9c1e  $1.22 savable of $1.22
 
 The session was resumed in a new environment, which changed the system prompt and forced the whole 156k-token context to be written to cache again at the 1-hour rate. That one call was a quarter of the session's cost. `-v` lists each occurrence (`turn 66 · 156k tokens · $1.22`) and the log file.
 
-A run is one unit of agent work: an OTLP trace, or a Claude Code session together with the sub-agents it started. The header gives the cost per run as a mean, median, 90th percentile and maximum, and avoidable spend per run and as a share of the total. With `--runs-per-month <n>` it adds what both come to in a month at that volume (mean cost per run × n).
+A run is one unit of agent work: an OTLP trace, or a Claude Code session together with the sub-agents it started. The header gives the cost per run as a mean, median, 90th percentile and maximum, and avoidable spend per run and as a share of the total. With `--runs-per-month <n>` it adds what both come to in a month at that volume (mean cost per run × n). Runs with no priced call (every call failed, or none reported usage) are left out of these figures and counted in the header, so a run that failed at its first call doesn't show up as a $0 run. Runs with some unpriced calls are counted, and the header says how many: their cost is a lower bound.
 
 Findings are grouped by session (or trace), the one where fixes would save most first. Each line has the severity, what fixing it would save, what it cost, the rule and what happened. In a terminal, long lines wrap to its width; piped, each finding stays on one line.
 
@@ -82,7 +82,7 @@ Stop the recorder with Ctrl-C, then `burnlint audit run.jsonl`.
 |---|---|---|---|
 | `duplicate-tool-call` | Same tool, identical input and identical result, nothing written and no shell command in between, earlier call didn't fail | Repeated result tokens, carried through the rest of the run | All of it |
 | `reread-unchanged` | Same file and range read again, same content returned, with no write to it (under any spelling of the path) and no shell command in between | Same | All of it |
-| `cache-thrash` | A turn after the first that writes more to the prompt cache than it reads, above 20k tokens. One finding per cause: cache expired, prompt prefix changed, model switched | Rewritten tokens at the write rate minus the read rate | Expired: net of a keep-alive (below). Prefix changed: all of it. Model switched: trade-off |
+| `cache-thrash` | A call that reads back at least 1,024 fewer tokens from the prompt cache than the previous call left in it, and writes them again. A large write alone doesn't count: new content has to be written once. One finding per cause: cache expired, prompt prefix changed, model switched | The lost tokens written again, at the write rate minus the read rate (what a stable prefix would have saved) | Expired: net of a keep-alive (below). Prefix changed: all of it. Model switched: trade-off |
 
 ### Cost, savable and trade-offs
 

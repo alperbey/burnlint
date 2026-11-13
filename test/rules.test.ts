@@ -181,8 +181,9 @@ test("cache-thrash: mid-run rewrite flagged with avoidable cost", () => {
   const f = cacheThrash.check(run, ctx);
   assert.equal(f.length, 1);
   assert.deepEqual(f[0]!.turns, [2]);
-  // sonnet-4-6: 5m write $3.75, read $0.30 -> 95000 * 3.45 / 1e6
-  assert.ok(Math.abs(f[0]!.costUsd! - (95000 * 3.45) / 1e6) < 1e-9);
+  // Turn 2 lost the 92k the previous call left cached; the other 3k it wrote are new and
+  // would be written anyway. sonnet-4-6: 5m write $3.75, read $0.30 -> 92000 * 3.45 / 1e6
+  assert.ok(Math.abs(f[0]!.costUsd! - (92000 * 3.45) / 1e6) < 1e-9);
   assert.match(f[0]!.message, /prefix changed/);
   assert.equal(f[0]!.fix, "no-loss");
   assert.equal(f[0]!.avoidableUsd, f[0]!.costUsd);
@@ -194,16 +195,17 @@ test("cache-thrash: expiry is savable only net of the keep-alive that would have
     { read: 0, w1: 91000, ts: "2026-11-01T12:30:00Z" },
   ]);
   const [f] = cacheThrash.check(run, ctx);
-  // sonnet-4-6: 1h write $6, read $0.30. 150 min idle = 2 pings of the previous prompt
+  // sonnet-4-6: 1h write $6, read $0.30. The 90k cached before the break are rewritten
+  // (the other 1k are new). 150 min idle = 2 pings of the previous prompt
   // (5 input + 90000 written), each a cache read.
-  const rewrite = (91000 * 5.7) / 1e6;
+  const rewrite = (90000 * 5.7) / 1e6;
   const ping = (90005 * 0.3) / 1e6;
   assert.ok(Math.abs(f!.costUsd! - rewrite) < 1e-9);
   assert.ok(Math.abs(f!.avoidableUsd! - (rewrite - 2 * ping)) < 1e-9);
   assert.equal(f!.fix, "no-loss");
   assert.equal(f!.message, "1 cache rewrite after 2h30m idle, within the 12h keep-alive");
-  assert.equal(f!.severity, "medium"); // severity follows the $0.46 saving, not the $0.52 cost
-  assert.deepEqual(f!.details, ["turn 2 · 91k tokens · $0.52 · idle 2h30m"]);
+  assert.equal(f!.severity, "medium"); // severity follows the $0.46 saving, not the $0.51 cost
+  assert.deepEqual(f!.details, ["turn 2 · 90k tokens · $0.51 · idle 2h30m"]);
 });
 
 test("cache-thrash: a break longer than the keep-alive pays for the pings and the rewrite", () => {
@@ -278,6 +280,47 @@ test("cache-thrash: long gap is reported as expiry", () => {
   ]);
   const f = cacheThrash.check(run, ctx);
   assert.match(f[0]!.message, /after 2h30m idle/);
+});
+
+test("cache-thrash: a big new tool result on a cold cache is not a rewrite", () => {
+  // Real shape (AI SDK, Sonnet 5.5): step 2 adds a 28k-token diff. It reads all that step 1
+  // cached and writes the new part once. The old rule (big write, more than read) fired here.
+  const run = cacheRun([{ read: 0, w5: 1065 }, { read: 1065, w5: 28209 }, { read: 29274, w5: 2873 }, { read: 32147, w5: 1051 }]);
+  assert.equal(cacheThrash.check(run, ctx).length, 0);
+});
+
+test("cache-thrash: savable is what was cached and lost, against a stable-prefix counterfactual", () => {
+  // Prefix busted every step (a timestamp in the system prompt): each call reads nothing and
+  // writes its whole prompt. A stable prefix would have read the previous prompt and written
+  // only the new part, so the waste is each previous prompt at write minus read.
+  const rows = [2048, 29229, 40258, 41514];
+  const run = cacheRun(rows.map((w) => ({ read: 0, w5: w })));
+  const [f] = cacheThrash.check(run, ctx);
+  // Each call's cached total is 0 read + its write (cacheRun adds 5 uncached input, not cached).
+  const lost = rows.slice(0, -1).reduce((s, w) => s + w, 0);
+  assert.ok(Math.abs(f!.avoidableUsd! - (lost * 3.45) / 1e6) < 1e-9);
+  assert.deepEqual(f!.turns, [1, 2, 3]);
+  // Independently: actual cost minus the cost of the same calls with a stable prefix.
+  const w = 3.75, r = 0.3;
+  const actual = rows.reduce((s, x) => s + x * w, 0);
+  const stable = rows.reduce((s, x, i) => s + (i ? rows[i - 1]! * r + (x - rows[i - 1]!) * w : x * w), 0);
+  assert.ok(Math.abs(f!.avoidableUsd! - (actual - stable) / 1e6) < 1e-9);
+});
+
+test("cache-thrash: a partial loss counts only the lost part", () => {
+  const run = cacheRun([{ read: 0, w5: 50000 }, { read: 30000, w5: 25000 }]);
+  const [f] = cacheThrash.check(run, ctx);
+  assert.equal(f!.tokens, 20000);
+  assert.ok(Math.abs(f!.costUsd! - (20000 * 3.45) / 1e6) < 1e-9);
+});
+
+test("cache-thrash: a failed call in between leaves the cache state alone; tiny losses are ignored", () => {
+  const run = cacheRun([{ read: 0, w5: 90000 }, { read: 0, w5: 0 }, { read: 90000, w5: 1000 }]);
+  run.turns[1]!.call.tokens = null;
+  run.turns[1]!.call.failed = true;
+  assert.equal(cacheThrash.check(run, ctx).length, 0);
+  const small = cacheRun([{ read: 0, w5: 90000 }, { read: 89500, w5: 1500 }]);
+  assert.equal(cacheThrash.check(small, ctx).length, 0);
 });
 
 test("cache-thrash: calls with unknown cache usage are skipped", () => {

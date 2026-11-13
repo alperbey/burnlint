@@ -31,6 +31,8 @@ export interface ModelCall {
   reportedProvider?: string;
   /** null when the source carried no usage for this call. */
   tokens: Tokens | null;
+  /** The call returned an error. It carries no usage; whether it was billed is unknown. */
+  failed?: boolean;
 }
 
 /**

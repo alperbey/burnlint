@@ -1,14 +1,20 @@
-import type { Finding, FixEffect, Run, Tokens } from "../model.js";
+import type { Finding, FixEffect, Run, Tokens, Turn } from "../model.js";
 import { cacheWriteTotal } from "../model.js";
 import type { Price } from "../pricing.js";
 import { compactTokens, formatDuration, severityFor, sumNullable, type Rule, type RuleContext } from "./types.js";
 
 /**
- * Turns (after the first) that write more to the prompt cache than they read
- * from it. In a healthy run the cached prefix grows by a small delta per turn;
- * a large rewrite means the cache expired between calls, the model changed, or
+ * Calls that read back less from the prompt cache than the previous call left
+ * in it, and wrote it again. With a stable prefix, each call reads everything
+ * the previous one cached (read + written) and writes only what is new since.
+ * Reading less means the cache expired between calls, the model changed, or
  * the prefix changed (edited system prompt, reordered tools, injected
- * timestamps).
+ * timestamps). A large write alone is not a rewrite: a big tool result is new
+ * content and has to be written once.
+ *
+ * Only the lost part is waste: min(cached before, written) tokens, at the
+ * write rate minus the read rate. New tokens are written either way.
+ * Calls without usage (failed) leave the cache state as it was.
  *
  * The first call after compaction is skipped: the context was replaced on
  * purpose and has to be cached again.
@@ -17,7 +23,7 @@ import { compactTokens, formatDuration, severityFor, sumNullable, type Rule, typ
  * are measured between response timestamps, so a gap a little under the TTL
  * can still be an expiry; the cause wording stays "likely".
  *
- * Cost = rewritten tokens priced at the write rate minus the read rate.
+ * Cost = lost tokens that were written again, at the write rate minus the read rate.
  *
  * One finding per cause, because the fixes differ:
  * - expired: no-loss. The fix is a keep-alive, which sends the same prompt.
@@ -32,32 +38,44 @@ import { compactTokens, formatDuration, severityFor, sumNullable, type Rule, typ
  */
 export const cacheThrash: Rule = {
   id: "cache-thrash",
-  description: "Large prompt-cache rewrites after the first turn",
+  description: "Prompt cache lost and written again after the first turn",
   check(run, ctx) {
     const groups: Record<Cause, CacheEvent[]> = { expired: [], "model-switch": [], prefix: [] };
 
-    for (let i = 1; i < run.turns.length; i++) {
+    // The last call with known cache usage, and what it left cached.
+    let prev: { turn: Turn; cached: number } | null = null;
+    for (let i = 0; i < run.turns.length; i++) {
       const turn = run.turns[i]!;
-      const prev = run.turns[i - 1]!;
       const t = turn.call.tokens;
-      if (!t || !t.cacheKnown || turn.contextReplacedBefore) continue;
+      if (!t) continue; // failed or no usage: the cache is as the last call left it
+      if (!t.cacheKnown) {
+        prev = null; // can't tell what is cached from here on
+        continue;
+      }
       const written = cacheWriteTotal(t);
       const read = t.cacheRead ?? 0;
-      if (written < ctx.config.cacheThrashMinTokens || written <= read) continue;
+      const before = prev;
+      prev = { turn, cached: read + written };
+      if (!before || turn.contextReplacedBefore) continue;
+      const lost = before.cached - read;
+      const rewritten = Math.min(lost, written);
+      if (lost < ctx.config.cacheThrashMinTokens || rewritten <= 0) continue;
+
       const price = ctx.prices.lookup(turn.call.model);
-      const gapMin =
-        prev.call.ts && turn.call.ts ? (Date.parse(turn.call.ts) - Date.parse(prev.call.ts)) / 60000 : undefined;
+      const pc = before.turn.call;
+      const gapMin = pc.ts && turn.call.ts ? (Date.parse(turn.call.ts) - Date.parse(pc.ts)) / 60000 : undefined;
       const ttlMin = (t.cacheWrite1h ?? 0) > written / 2 ? 60 : 5;
       const cause: Cause =
         gapMin != null && gapMin > ttlMin * 0.9
           ? "expired"
-          : prev.call.model && turn.call.model && prev.call.model !== turn.call.model
+          : pc.model && turn.call.model && pc.model !== turn.call.model
             ? "model-switch"
             : "prefix";
-      const cost = price ? rewriteCost(t, price) : null;
+      // The call's own write rate (5m and 1h mix), applied to the rewritten part only.
+      const cost = price ? (rewriteCost(t, price) * rewritten) / written : null;
       const keepAlive =
-        cause === "expired" && price ? keepAliveCost(gapMin!, ttlMin, prefixTokens(prev.call.tokens) || read + written, price, ctx) : null;
-      groups[cause].push({ turn: i, written, cost, gapMin, keepAlive });
+        cause === "expired" && price ? keepAliveCost(gapMin!, ttlMin, prefixTokens(pc.tokens) || before.cached, price, ctx) : null;
+      groups[cause].push({ turn: i, written: rewritten, cost, gapMin, keepAlive });
     }
 
     const findings: Finding[] = [];

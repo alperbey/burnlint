@@ -119,3 +119,21 @@ test("JSONL with one request per line; tools attach to the preceding call", () =
   assert.equal(run.turns[0]!.tools[0]!.resultTokens, 1000);
   assert.equal(run.turns[1]!.tools.length, 0);
 });
+
+test("a model span with error status and no usage is a failed call, not a call without usage", () => {
+  const failed = { ...chatSpan("1", 0, { "gen_ai.provider.name": "anthropic", "gen_ai.request.model": "claude-sonnet-4-6" }), status: { code: 2, message: "invalid x-api-key" } };
+  const ok = chatSpan("2", 10, {
+    "gen_ai.provider.name": "anthropic",
+    "gen_ai.request.model": "claude-sonnet-4-6",
+    "gen_ai.usage.input_tokens": 100,
+    "gen_ai.usage.output_tokens": 10,
+  });
+  const run = readOtlp(tmpFile("t.json", JSON.stringify(otlp([failed, ok]))))[0]!;
+  assert.equal(run.turns[0]!.call.failed, true);
+  assert.equal(run.turns[1]!.call.failed, undefined);
+  assert.match(run.notes.join("\n"), /1 model call\(s\) failed with an error status/);
+  assert.doesNotMatch(run.notes.join("\n"), /no usage data/);
+  // The string form some JSON encoders use is read too.
+  const named = { ...failed, status: { code: "STATUS_CODE_ERROR" } };
+  assert.equal(readOtlp(tmpFile("t.json", JSON.stringify(otlp([named]))))[0]!.turns[0]!.call.failed, true);
+});

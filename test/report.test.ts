@@ -9,7 +9,7 @@ import { renderMarkdown, renderTable } from "../src/report.js";
 import { ccAssistant, ccUser, jsonl } from "./helpers.js";
 
 const runOf = (id: string, extra: Partial<RunSummary> = {}): RunSummary => ({
-  id, file: `/logs/${id.split("#")[0]}.jsonl`, source: "claude-code", calls: 10, pricedCalls: 10, costUsd: 5, unpricedModels: [], notes: [], ...extra,
+  id, file: `/logs/${id.split("#")[0]}.jsonl`, source: "claude-code", calls: 10, pricedCalls: 10, failedCalls: 0, costUsd: 5, unpricedModels: [], notes: [], ...extra,
 });
 
 const finding = (runId: string, extra: Partial<Finding>): Finding => ({
@@ -34,6 +34,7 @@ function result(): AuditResult {
     files: 5, skippedFiles: [], ignoredFiles: ["/logs/x.meta.json", "/logs/y.json"], runs, findings,
     totalCostUsd: 15, findingsCostUsd: 16.05, avoidableUsd: 10.55, prices: { source: "test", retrieved: "2026-11-12" },
     perRun: { count: 2, meanUsd: 7.5, medianUsd: 7.5, p90Usd: 10, maxUsd: 10, avoidableUsd: 5.275, avoidableShare: 0.7033, incomplete: 0 },
+    excludedRuns: { failed: 0, unpriced: 0 },
   };
 }
 
@@ -132,4 +133,43 @@ test("the header shows cost per run and, with a volume, per month", () => {
   assert.match(out, /avoidable\s+\$10\.55\s+\$5\.28 per run, 70\.3% of spend/);
   assert.match(out, /per month\s+\$75,000\.00\s+at 10,000 runs, \$52,750\.00 of it avoidable/);
   assert.match(renderMarkdown(r), /\| per month \| \*\*\$75,000\.00\*\* \|/);
+});
+
+test("runs with no priced call are left out of cost per run and counted as failed or unpriced", () => {
+  const dir = mkdtempSync(join(tmpdir(), "burnlint-failed-"));
+  const usage = { input_tokens: 1000, output_tokens: 100 };
+  const ok = (session: string, id: string) => ({ ...ccAssistant({ id, usage }), sessionId: session });
+  // Claude Code writes a failed API call as a <synthetic> assistant message with zero usage.
+  const apiError = (session: string, id: string) => ({
+    ...ccAssistant({ id, model: "<synthetic>", usage: { input_tokens: 0, output_tokens: 0 } }),
+    sessionId: session,
+    isApiErrorMessage: true,
+  });
+  writeFileSync(join(dir, "a.jsonl"), jsonl([{ ...ccUser("go"), sessionId: "a" }, ok("a", "a1")]));
+  writeFileSync(join(dir, "b.jsonl"), jsonl([{ ...ccUser("go"), sessionId: "b" }, ok("b", "b1"), ok("b", "b2"), apiError("b", "b3")]));
+  writeFileSync(join(dir, "c.jsonl"), jsonl([{ ...ccUser("go"), sessionId: "c" }, apiError("c", "c1")]));
+  writeFileSync(join(dir, "d.jsonl"), jsonl([{ ...ccUser("go"), sessionId: "d" }, { ...ccAssistant({ id: "d1", usage: { input_tokens: 0, output_tokens: 0 } }), sessionId: "d" }]));
+  const r = audit([dir]);
+  const one = (1000 * 3 + 100 * 15) / 1e6;
+  assert.equal(r.runs.length, 4);
+  assert.equal(r.perRun!.count, 2);
+  assert.ok(Math.abs(r.perRun!.medianUsd - 1.5 * one) < 1e-12);
+  assert.equal(r.perRun!.incomplete, 1); // b: priced, with one failed call
+  assert.deepEqual(r.excludedRuns, { failed: 1, unpriced: 1 });
+  const b = r.runs.find((x) => x.session === "b")!;
+  assert.equal(b.failedCalls, 1);
+  assert.match(b.notes.join("\n"), /1 of 3 model call\(s\) failed with an API error/);
+  assert.doesNotMatch(b.notes.join("\n"), /no usage data/);
+  assert.match(renderTable(r), /2 runs in 4 files · not counted: 1 failed, 1 with no usage data · 1 run priced in part \(lower bound\)/);
+});
+
+test("nothing priced at all: no cost per run, and the header says why", () => {
+  const dir = mkdtempSync(join(tmpdir(), "burnlint-failed-"));
+  writeFileSync(
+    join(dir, "c.jsonl"),
+    jsonl([{ ...ccUser("go"), sessionId: "c" }, { ...ccAssistant({ id: "c1", model: "<synthetic>", usage: { input_tokens: 0, output_tokens: 0 } }), sessionId: "c", isApiErrorMessage: true }]),
+  );
+  const r = audit([dir]);
+  assert.equal(r.perRun, null);
+  assert.match(renderTable(r), /0 runs in 1 file · not counted: 1 failed/);
 });

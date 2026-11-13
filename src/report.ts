@@ -39,8 +39,7 @@ export function renderTable(r: AuditResult, opts: TableOptions = {}): string {
   const runs = new Map(r.runs.map((run) => [run.id, run]));
   const out: string[] = [];
 
-  const p = r.perRun;
-  out.push(`${c("1", "burnlint")}  ${dim(`${plural(p?.count ?? 0, "run")} in ${plural(r.files - r.ignoredFiles.length, "file")}`)}`);
+  out.push(`${c("1", "burnlint")}  ${dim(`${runsSummary(r)}`)}`);
   out.push("");
   for (const [label, value, note] of totalLines(r)) {
     const lead = `  ${label.padEnd(12)} ${value}   `;
@@ -115,7 +114,7 @@ export function renderMarkdown(r: AuditResult): string {
   const out: string[] = [];
   out.push(`### burnlint`);
   out.push("");
-  out.push(`${plural(r.perRun?.count ?? 0, "run")}`);
+  out.push(runsSummary(r));
   out.push("");
   out.push("| | Total | |");
   out.push("|---|--:|---|");
@@ -146,6 +145,20 @@ export function renderMarkdown(r: AuditResult): string {
   out.push("");
   out.push(`<sub>Costs are estimates. Prices: ${r.prices.source}, retrieved ${r.prices.retrieved}.</sub>`);
   return out.join("\n");
+}
+
+/**
+ * "12 runs in 1 file", plus runs left out of cost per run (no priced call) and
+ * counted runs whose cost is a lower bound.
+ */
+function runsSummary(r: AuditResult): string {
+  const parts = [`${plural(r.perRun?.count ?? 0, "run")} in ${plural(r.files - r.ignoredFiles.length, "file")}`];
+  const { failed, unpriced } = r.excludedRuns;
+  const left = [failed ? `${failed} failed` : "", unpriced ? `${unpriced} with no usage data` : ""].filter(Boolean);
+  if (left.length) parts.push(`not counted: ${left.join(", ")}`);
+  const part = r.perRun?.incomplete ?? 0;
+  if (part) parts.push(`${plural(part, "run")} priced in part (lower bound)`);
+  return parts.join(" · ");
 }
 
 /** The header block: label, value padded to a common width, and what it means per run. */

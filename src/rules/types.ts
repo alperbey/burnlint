@@ -5,7 +5,7 @@ export interface RuleConfig {
   /** USD at or above which a finding is high / medium severity. */
   highUsd: number;
   mediumUsd: number;
-  /** cache-thrash: minimum rewritten tokens for a turn to count. */
+  /** cache-thrash: minimum cached tokens a call must lose for it to count. */
   cacheThrashMinTokens: number;
   /**
    * cache-thrash: how long the assumed keep-alive keeps an idle cache warm
@@ -18,7 +18,7 @@ export interface RuleConfig {
 export const defaultConfig: RuleConfig = {
   highUsd: 1,
   mediumUsd: 0.1,
-  cacheThrashMinTokens: 20_000,
+  cacheThrashMinTokens: 1024,
   keepAliveHours: 12,
 };
 

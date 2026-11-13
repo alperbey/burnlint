@@ -30,6 +30,8 @@ interface Line {
   isSidechain?: boolean;
   agentId?: string;
   requestId?: string;
+  /** A failed API call, written as a `<synthetic>` assistant message with zero usage. */
+  isApiErrorMessage?: boolean;
   message?: {
     id?: string;
     model?: string;
@@ -99,6 +101,7 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
   const byMessageId = new Map<string, Turn>();
   const toolsById = new Map<string, ToolCall>();
   let noUsage = 0;
+  let failed = 0;
   let humanPending = false;
   let compactionPending = false;
 
@@ -113,8 +116,10 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
       const mid = msg.id ?? d.requestId ?? `line-${turns.length}`;
       let turn = byMessageId.get(mid);
       if (!turn) {
-        const tokens = parseUsage(msg.usage);
-        if (!tokens) noUsage++;
+        const failedCall = d.isApiErrorMessage === true;
+        const tokens = failedCall ? null : parseUsage(msg.usage);
+        if (failedCall) failed++;
+        else if (!tokens) noUsage++;
         const prov = resolveProvider({ model: msg.model });
         const call: ModelCall = {
           id: mid,
@@ -123,6 +128,7 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
           provider: prov.provider,
           providerSource: prov.source,
           tokens,
+          failed: failedCall || undefined,
         };
         turn = {
           index: turns.length,
@@ -169,6 +175,7 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
 
   const notes: string[] = [];
   if (noUsage) notes.push(`${noUsage} of ${turns.length} model call(s) have no usage data (not priced)`);
+  if (failed) notes.push(`${failed} of ${turns.length} model call(s) failed with an API error (not priced)`);
   return { id, source: "claude-code", file, agent, turns, notes };
 }
 

@@ -38,6 +38,7 @@ interface OtlpSpan {
   name: string;
   startTimeUnixNano?: string | number;
   attributes?: KeyValue[];
+  status?: { code?: number | string };
 }
 
 interface ExportRequest {
@@ -55,6 +56,8 @@ interface Span {
   start: bigint;
   attrs: Record<string, unknown>;
   service?: string;
+  /** Span status is ERROR. */
+  error: boolean;
 }
 
 export function looksLikeOtlp(text: string): boolean {
@@ -116,6 +119,7 @@ export function readOtlp(file: string): Run[] {
             start: BigInt(s.startTimeUnixNano ?? 0),
             attrs: attrsOf(s.attributes),
             service: typeof res["service.name"] === "string" ? (res["service.name"] as string) : undefined,
+            error: s.status?.code === 2 || s.status?.code === "STATUS_CODE_ERROR",
           });
         }
       }
@@ -176,6 +180,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
   let relabeled = 0;
   let cacheUnknown = 0;
   let noUsage = 0;
+  let failed = 0;
   const relabels = new Set<string>();
 
   const turns: Turn[] = llm.map((s, index) => {
@@ -210,6 +215,8 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
       t.reasoning = num(a["gen_ai.usage.reasoning.output_tokens"]);
       if (!t.cacheKnown) cacheUnknown++;
       tokens = t;
+    } else if (s.error) {
+      failed++;
     } else {
       noUsage++;
     }
@@ -222,6 +229,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
       providerSource: prov.source,
       reportedProvider: prov.source === "relabeled" ? prov.reported : undefined,
       tokens,
+      failed: (s.error && !tokens) || undefined,
     };
     return { index, call, tools: [] };
   });
@@ -248,6 +256,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
   if (cacheUnknown)
     notes.push(`${cacheUnknown} call(s) report no cache usage; their cost is an upper bound (cached tokens priced at full rate)`);
   if (noUsage) notes.push(`${noUsage} model call(s) have no usage data (not priced)`);
+  if (failed) notes.push(`${failed} model call(s) failed with an error status (not priced)`);
   if (aggregates) notes.push(`${aggregates} aggregate span(s) skipped to avoid double counting`);
   if (orphanTools) notes.push(`${orphanTools} tool span(s) started before any model call`);
 
