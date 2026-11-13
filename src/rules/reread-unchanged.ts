@@ -1,41 +1,45 @@
 import type { Finding } from "../model.js";
 import { carriedCost } from "../pricing.js";
-import { baseToolName } from "../tools.js";
+import { mayBeSameFile } from "../tools.js";
 import { severityFor, sumNullable, turnList, type Rule } from "./types.js";
-
-/** Tools that can change files without naming them. They invalidate every earlier read. */
-const SHELL_TOOLS = /^(bash|shell|sh|exec|run_command|run_terminal_cmd|execute_command|device_bash|terminal)$/i;
 
 /**
  * A file (same path, same range) read again with no write to it in between.
  * The second copy of the content sits in context for the rest of the run.
+ *
+ * Stays silent when the file may have changed: after a write to a path that
+ * could be the same file, after any shell command or write without a target,
+ * after a human message or compaction, and when the two reads returned
+ * different content.
  */
 export const rereadUnchanged: Rule = {
   id: "reread-unchanged",
   description: "File read again with no change to it in between",
   check(run, ctx) {
-    const lastRead = new Map<string, { turn: number; target: string }>();
+    const lastRead = new Map<string, { turn: number; target: string; resultKey?: string }>();
     const groups = new Map<string, { target: string; turns: number[]; repeats: Array<{ turn: number; tokens?: number }> }>();
 
     for (const turn of run.turns) {
-      if (turn.humanInputBefore) lastRead.clear();
+      if (turn.humanInputBefore || turn.contextReplacedBefore) lastRead.clear();
       for (const tool of turn.tools) {
         if (tool.kind === "write") {
           if (tool.target) {
-            for (const [k, v] of lastRead) if (v.target === tool.target) lastRead.delete(k);
+            for (const [k, v] of lastRead) if (mayBeSameFile(v.target, tool.target)) lastRead.delete(k);
           } else {
             lastRead.clear();
           }
           continue;
         }
-        if (SHELL_TOOLS.test(baseToolName(tool.name))) {
+        if (tool.kind === "shell") {
           lastRead.clear();
           continue;
         }
         if (tool.kind !== "read" || !tool.target || tool.isError) continue;
         const key = `${tool.target}\u0000${tool.inputKey ?? ""}`;
         const prev = lastRead.get(key);
-        if (prev) {
+        // Different content means something outside the trace changed the file.
+        const changed = prev?.resultKey !== undefined && tool.resultKey !== undefined && prev.resultKey !== tool.resultKey;
+        if (prev && !changed) {
           let g = groups.get(key);
           if (!g) {
             g = { target: tool.target, turns: [prev.turn], repeats: [] };
@@ -44,7 +48,7 @@ export const rereadUnchanged: Rule = {
           g.turns.push(turn.index);
           g.repeats.push({ turn: turn.index, tokens: tool.resultTokens });
         }
-        lastRead.set(key, { turn: turn.index, target: tool.target });
+        lastRead.set(key, { turn: turn.index, target: tool.target, resultKey: tool.resultKey });
       }
     }
 

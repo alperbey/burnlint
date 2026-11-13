@@ -9,16 +9,21 @@
 // - Tool results arrive in later "user" lines as tool_result blocks keyed by
 //   tool_use_id.
 // - Sub-agent work is marked isSidechain and grouped into its own run.
+// - Compaction writes a system line with subtype "compact_boundary", then a
+//   user line with isCompactSummary. Neither is human input.
 
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import type { ModelCall, Run, ToolCall, Tokens, Turn } from "../model.js";
 import { emptyTokens } from "../model.js";
 import { resolveProvider } from "../pricing.js";
-import { classifyTool, estimateTokens, resultText, stableKey } from "../tools.js";
+import { classifyTool, contentKey, estimateTokens, resultText, stableKey } from "../tools.js";
 
 interface Line {
   type?: string;
+  subtype?: string;
+  isMeta?: boolean;
+  isCompactSummary?: boolean;
   sessionId?: string;
   timestamp?: string;
   isSidechain?: boolean;
@@ -33,11 +38,18 @@ interface Line {
   };
 }
 
+/**
+ * Session bookkeeping records that can come before the first message. A
+ * session can open with these and a single message line larger than the
+ * sniffed head (v2.1.x: queue-operation lines, then a 70KB user line).
+ */
+const SESSION_RECORD_TYPES = new Set(["user", "assistant", "system", "summary", "attachment", "queue-operation", "last-prompt", "custom-title", "agent-name", "cost-state"]);
+
 export function looksLikeClaudeCode(firstLines: string[]): boolean {
   return firstLines.some((l) => {
     try {
       const d = JSON.parse(l) as Line;
-      return typeof d.sessionId === "string" && (d.type === "user" || d.type === "assistant" || "parentUuid" in d);
+      return typeof d.sessionId === "string" && (SESSION_RECORD_TYPES.has(d.type ?? "") || "parentUuid" in d);
     } catch {
       return false;
     }
@@ -57,7 +69,8 @@ export function readClaudeCode(file: string): Run[] {
       bad++;
       continue;
     }
-    if (d.type !== "assistant" && d.type !== "user") continue;
+    const compaction = d.type === "system" && d.subtype === "compact_boundary";
+    if (d.type !== "assistant" && d.type !== "user" && !compaction) continue;
     const key = d.isSidechain ? `sidechain:${d.agentId ?? "agent"}` : "main";
     if (!groups.has(key)) groups.set(key, { agent: d.isSidechain ? d.agentId ?? "sub-agent" : undefined, records: [] });
     groups.get(key)!.records.push(d);
@@ -79,8 +92,10 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
   const toolsById = new Map<string, ToolCall>();
   let noUsage = 0;
   let humanPending = false;
+  let compactionPending = false;
 
   for (const d of records) {
+    if ((d.type === "system" && d.subtype === "compact_boundary") || d.isCompactSummary) compactionPending = true;
     const msg = d.message;
     if (!msg) continue;
 
@@ -101,8 +116,15 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
           providerSource: prov.source,
           tokens,
         };
-        turn = { index: turns.length, humanInputBefore: humanPending || undefined, call, tools: [] };
+        turn = {
+          index: turns.length,
+          humanInputBefore: humanPending || undefined,
+          contextReplacedBefore: compactionPending || undefined,
+          call,
+          tools: [],
+        };
         humanPending = false;
+        compactionPending = false;
         turns.push(turn);
         byMessageId.set(mid, turn);
       }
@@ -132,6 +154,7 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
         if (!tool) continue;
         tool.isError = block.is_error === true;
         tool.resultTokens = estimateTokens(resultText(block.content));
+        tool.resultKey = contentKey(block.content);
       }
     }
   }
@@ -141,9 +164,9 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
   return { id, source: "claude-code", file, agent, turns, notes };
 }
 
-/** A user line typed by a person: text content, no tool results, not injected meta. */
-function isHumanMessage(d: Line & { isMeta?: boolean }): boolean {
-  if (d.isMeta) return false;
+/** A user line typed by a person: text content, no tool results, not injected meta or a compaction summary. */
+function isHumanMessage(d: Line): boolean {
+  if (d.isMeta || d.isCompactSummary) return false;
   const content = d.message?.content;
   if (typeof content === "string") return content.trim().length > 0;
   const blocks = asBlocks(content);

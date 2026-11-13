@@ -1,8 +1,26 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readClaudeCode } from "../src/adapters/claude-code.js";
+import { loadRuns } from "../src/audit.js";
 import { callCost, PriceTable } from "../src/pricing.js";
 import { ccAssistant, ccToolResult, ccUser, jsonl, tmpFile } from "./helpers.js";
+
+test("a session that opens with bookkeeping and an oversized first message is still recognized", () => {
+  const file = tmpFile(
+    "s.jsonl",
+    jsonl([
+      { type: "queue-operation", operation: "enqueue", sessionId: "s1", timestamp: "2026-11-01T10:00:00Z" },
+      { type: "queue-operation", operation: "dequeue", sessionId: "s1", timestamp: "2026-11-01T10:00:00Z" },
+      ccUser("x".repeat(70_000)),
+      ccAssistant({ id: "m1" }),
+    ]),
+  );
+  const runs = loadRuns(file);
+  assert.ok(runs, "detected as a Claude Code session");
+  assert.equal(runs[0]!.turns.length, 1);
+  // Other JSONL with a sessionId is not taken for a session.
+  assert.equal(loadRuns(tmpFile("o.jsonl", jsonl([{ sessionId: "abc", type: "page_view" }]))), null);
+});
 
 test("split assistant lines with one message id count usage once", () => {
   const usage = { input_tokens: 2, output_tokens: 1366, cache_read_input_tokens: 138591, cache_creation_input_tokens: 156248, cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 156248 } };
@@ -70,6 +88,23 @@ test("human messages mark turn boundaries; tool results do not", () => {
     turns.map((t) => !!t.humanInputBefore),
     [true, false, true],
   );
+});
+
+test("compaction marks the next call as context-replaced, not as human input", () => {
+  // Record shapes as Claude Code v2.1.x writes them (flags only; content redacted).
+  const file = tmpFile(
+    "s.jsonl",
+    jsonl([
+      ccUser("first"),
+      ccAssistant({ id: "m1", text: "a" }),
+      { type: "system", subtype: "compact_boundary", sessionId: "s1", uuid: "c1", parentUuid: null, compactMetadata: { trigger: "auto", preTokens: 160000 } },
+      { ...ccUser("summary of the conversation so far"), isCompactSummary: true, isVisibleInTranscriptOnly: true },
+      ccAssistant({ id: "m2", text: "b" }),
+      ccAssistant({ id: "m3", text: "c" }),
+    ]),
+  );
+  const turns = readClaudeCode(file)[0]!.turns;
+  assert.deepEqual(turns.map((t) => [!!t.humanInputBefore, !!t.contextReplacedBefore]), [[true, false], [false, true], [false, false]]);
 });
 
 test("sidechain records become a separate run", () => {

@@ -98,6 +98,14 @@ test("aggregate parent spans with usage are skipped", () => {
   assert.match(run.notes.join("\n"), /aggregate/);
 });
 
+test("a truncated JSONL line is skipped and noted, the rest of the file is read", () => {
+  const good = JSON.stringify(otlp([chatSpan("1", 0, { "gen_ai.request.model": "gpt-5.5", "gen_ai.usage.input_tokens": 100, "gen_ai.usage.output_tokens": 10 })]));
+  const run = readOtlp(tmpFile("t.jsonl", `${good}\n{"resourceSpans":[{"scope`))[0]!;
+  assert.equal(run.turns.length, 1);
+  assert.match(run.notes.join("\n"), /1 unparseable line\(s\) skipped/);
+  assert.throws(() => readOtlp(tmpFile("t.jsonl", `{"resourceSpans":[{"scope`)), /not valid JSON/);
+});
+
 test("JSONL with one request per line; tools attach to the preceding call", () => {
   const lines = [
     otlp([chatSpan("1", 0, { "gen_ai.request.model": "gpt-5.5", "gen_ai.usage.input_tokens": 100, "gen_ai.usage.output_tokens": 10 })]),

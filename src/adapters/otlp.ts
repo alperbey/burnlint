@@ -19,7 +19,7 @@ import { basename } from "node:path";
 import type { ModelCall, Run, ToolCall, Turn } from "../model.js";
 import { emptyTokens } from "../model.js";
 import { resolveProvider } from "../pricing.js";
-import { classifyTool, estimateTokens, stableKey } from "../tools.js";
+import { classifyTool, contentKey, estimateTokens, stableKey } from "../tools.js";
 
 type AnyValue = {
   stringValue?: string;
@@ -78,23 +78,32 @@ function attrsOf(kvs: KeyValue[] | undefined): Record<string, unknown> {
   return out;
 }
 
-function parseRequests(text: string): ExportRequest[] {
+function parseRequests(text: string): { requests: ExportRequest[]; badLines: number } {
   const trimmed = text.trim();
   try {
     const whole = JSON.parse(trimmed);
-    return Array.isArray(whole) ? whole : [whole];
+    return { requests: Array.isArray(whole) ? whole : [whole], badLines: 0 };
   } catch {
-    // JSONL
-    return trimmed
-      .split("\n")
-      .filter((l) => l.trim())
-      .map((l) => JSON.parse(l) as ExportRequest);
+    // JSONL. A line cut short (recorder killed mid-write) costs that line, not the file.
+    const requests: ExportRequest[] = [];
+    let badLines = 0;
+    for (const line of trimmed.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        requests.push(JSON.parse(line) as ExportRequest);
+      } catch {
+        badLines++;
+      }
+    }
+    if (!requests.length) throw new Error("not valid JSON or JSONL");
+    return { requests, badLines };
   }
 }
 
 export function readOtlp(file: string): Run[] {
   const spans: Span[] = [];
-  for (const req of parseRequests(readFileSync(file, "utf8"))) {
+  const { requests, badLines } = parseRequests(readFileSync(file, "utf8"));
+  for (const req of requests) {
     for (const rs of req.resourceSpans ?? []) {
       const res = attrsOf(rs.resource?.attributes);
       for (const ss of rs.scopeSpans ?? []) {
@@ -122,6 +131,7 @@ export function readOtlp(file: string): Run[] {
   const runs: Run[] = [];
   for (const [traceId, list] of byTrace) {
     const run = buildRun(list, file, traceId);
+    if (badLines) run.notes.push(`${badLines} unparseable line(s) skipped`);
     if (run.turns.length) runs.push(run);
   }
   return runs;
@@ -278,6 +288,7 @@ function toolFromSpan(s: Span): ToolCall {
     isError: s.attrs["error.type"] != null ? true : undefined,
     resultTokens:
       result === undefined ? undefined : estimateTokens(typeof result === "string" ? result : JSON.stringify(result)),
+    resultKey: result === undefined ? undefined : contentKey(result),
   };
 }
 

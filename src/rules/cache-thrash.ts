@@ -7,20 +7,27 @@ import { severityFor, sumNullable, type Rule } from "./types.js";
  * Turns (after the first) that write more to the prompt cache than they read
  * from it. In a healthy run the cached prefix grows by a small delta per turn;
  * a large rewrite means the prefix changed (edited system prompt, reordered
- * tools, injected timestamps) or the cache expired between calls.
+ * tools, injected timestamps, model switch) or the cache expired between calls.
  *
- * Avoidable cost = rewritten tokens priced at the write rate minus the read rate.
+ * The first call after compaction is skipped: the context was replaced on
+ * purpose and has to be cached again.
+ *
+ * Expiry is judged against the TTL the call wrote with (1h writes vs 5m). Gaps
+ * are measured between response timestamps, so a gap a little under the TTL
+ * can still be an expiry; the cause wording stays "likely".
+ *
+ * Cost = rewritten tokens priced at the write rate minus the read rate.
  */
 export const cacheThrash: Rule = {
   id: "cache-thrash",
   description: "Large prompt-cache rewrites after the first turn",
   check(run, ctx) {
-    const events: Array<{ turn: number; written: number; cost: number | null; gapMin?: number }> = [];
+    const events: Array<{ turn: number; written: number; cost: number | null; gapMin?: number; expired: boolean }> = [];
 
     for (let i = 1; i < run.turns.length; i++) {
       const turn = run.turns[i]!;
       const t = turn.call.tokens;
-      if (!t || !t.cacheKnown) continue;
+      if (!t || !t.cacheKnown || turn.contextReplacedBefore) continue;
       const written = cacheWriteTotal(t);
       const read = t.cacheRead ?? 0;
       if (written < ctx.config.cacheThrashMinTokens || written <= read) continue;
@@ -28,17 +35,18 @@ export const cacheThrash: Rule = {
       const prevTs = run.turns[i - 1]?.call.ts;
       const gapMin =
         prevTs && turn.call.ts ? (Date.parse(turn.call.ts) - Date.parse(prevTs)) / 60000 : undefined;
-      events.push({ turn: i, written, cost: price ? rewriteCost(t, price) : null, gapMin });
+      const ttlMin = (t.cacheWrite1h ?? 0) > written / 2 ? 60 : 5;
+      events.push({ turn: i, written, cost: price ? rewriteCost(t, price) : null, gapMin, expired: gapMin != null && gapMin > ttlMin * 0.9 });
     }
 
     if (!events.length) return [];
     const cost = sumNullable(events.map((e) => e.cost));
     const tokens = events.reduce((s, e) => s + e.written, 0);
-    const expired = events.filter((e) => e.gapMin != null && e.gapMin > 5);
+    const expired = events.filter((e) => e.expired);
     const detail = events
       .slice(0, 5)
       .map((e) => {
-        const gap = e.gapMin != null && e.gapMin > 5 ? `, ${formatGap(e.gapMin)} after previous call` : "";
+        const gap = e.expired && e.gapMin != null ? `, ${formatGap(e.gapMin)} after previous call` : "";
         return `turn ${e.turn + 1}: ${e.written.toLocaleString("en-US")} tokens${gap}`;
       })
       .join("; ");

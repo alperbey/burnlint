@@ -33,7 +33,11 @@ export interface ModelCall {
   tokens: Tokens | null;
 }
 
-export type ToolKind = "read" | "write" | "other";
+/**
+ * read/write: file tools. shell: runs arbitrary commands, so it can change
+ * anything and its output depends on state the trace doesn't show.
+ */
+export type ToolKind = "read" | "write" | "shell" | "other";
 
 export interface ToolCall {
   id: string;
@@ -49,6 +53,8 @@ export interface ToolCall {
   isError?: boolean;
   /** Estimated size of the tool result in tokens (chars / 4). undefined if unknown. */
   resultTokens?: number;
+  /** Hash of the tool result, for equality checks. undefined if the result is unknown. */
+  resultKey?: string;
 }
 
 export interface Turn {
@@ -58,6 +64,12 @@ export interface Turn {
    * world may have changed, so repeat-detection rules start fresh.
    */
   humanInputBefore?: boolean;
+  /**
+   * True when the context was replaced just before this call (compaction).
+   * Earlier tool results are gone from context and the prompt cache has to be
+   * rebuilt, so neither a re-read nor a full cache write is waste.
+   */
+  contextReplacedBefore?: boolean;
   call: ModelCall;
   /** Tool calls requested by this model call. */
   tools: ToolCall[];
