@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readOtlp } from "../src/adapters/otlp.js";
+import { audit } from "../src/audit.js";
+import type { Turn } from "../src/model.js";
 import { PriceTable } from "../src/pricing.js";
 import { cacheThrash } from "../src/rules/cache-thrash.js";
 import { rereadUnchanged } from "../src/rules/reread-unchanged.js";
@@ -175,3 +177,73 @@ test("a prompt that shrinks starts a new context: repeat and cache rules start o
   const dip = readOtlp(tmpFile("t.json", JSON.stringify(otlp(spans(usage(5500, 5400, 90))))))[0]!;
   assert.equal(dip.turns[2]!.contextReplacedBefore, undefined);
 });
+
+// Real AI SDK 7 captures (bench/ai-sdk/agent.mjs, Claude Sonnet 5.5), redacted with
+// scripts/redact-capture.mjs. Each file: an "explain" run in the normal variant, the same
+// task with the time in the system prompt (prefix busted every step), and a run whose only
+// call failed. Each run has two generateText calls in one trace (answer, then check), and the
+// check call was given only the final answer, so its prompt shrinks: a context reset.
+// Token totals below are what the SDK itself reported for the run (result.totalUsage), not
+// read from the trace.
+const SDK_TOTALS: Record<string, { input: number; read: number; write: number; output: number }> = {
+  "5ce38dc5fa89": { input: 24825, read: 13293, write: 11512, output: 2176 }, // legacy normal
+  "829c8f1f9a32": { input: 36708, read: 0, write: 36688, output: 2538 }, // legacy prefix
+  f16f2c15d069: { input: 26447, read: 14578, write: 11849, output: 2440 }, // semconv normal
+  "694b0ad6abc2": { input: 27950, read: 0, write: 27932, output: 2326 }, // semconv prefix
+};
+
+for (const [format, failedId] of [["legacy", "9cdd1c67f10a"], ["semconv", "e49833e1bce0"]] as const) {
+  test(`real AI SDK 7 capture (${format}): cost matches the SDK's own usage, failed run counted apart`, () => {
+    const file = join(root, "fixtures", `ai-sdk-v7-${format}.jsonl`);
+    const runs = readOtlp(file);
+    const price = new PriceTable().lookup("claude-sonnet-5-5")!;
+    for (const run of runs) {
+      const id = run.id.split("#")[1]!;
+      assert.equal(run.dialect, format === "legacy" ? "ai-sdk" : "gen_ai");
+      if (id === failedId) {
+        assert.equal(run.turns.length, 1);
+        assert.equal(run.turns[0]!.call.failed, true);
+        continue;
+      }
+      const want = SDK_TOTALS[id]!;
+      const sum = (f: (t: NonNullable<Turn["call"]["tokens"]>) => number) => run.turns.reduce((s, t) => s + f(t.call.tokens!), 0);
+      assert.equal(sum((t) => t.cacheRead ?? 0), want.read);
+      assert.equal(sum((t) => t.cacheWriteOther ?? 0), want.write);
+      assert.equal(sum((t) => t.input! + (t.cacheRead ?? 0) + (t.cacheWriteOther ?? 0)), want.input);
+      assert.equal(sum((t) => t.output ?? 0), want.output);
+      assert.equal(run.turns.filter((t) => t.contextReplacedBefore).length, 1);
+      assert.ok(run.turns.some((t) => t.tools.some((x) => x.name === "read_file" && x.kind === "read" && x.resultTokens! > 0)));
+    }
+    const r = audit([file]);
+    for (const s of r.runs.filter((x) => !x.id.endsWith(failedId))) {
+      const t = SDK_TOTALS[s.id.split("#")[1]!]!;
+      const want = ((t.input - t.read - t.write) * price.input! + t.read * price.cacheRead! + t.write * price.cacheWrite5m! + t.output * price.output!) / 1e6;
+      assert.ok(Math.abs(s.costUsd - want) < 1e-9, `${s.id}: ${s.costUsd} vs ${want}`);
+    }
+    assert.deepEqual(r.excludedRuns, { failed: 1, unpriced: 0 });
+    assert.equal(r.perRun!.count, 2);
+  });
+
+  test(`real AI SDK 7 capture (${format}): cache-thrash only on the busted prefix, savable = stable-prefix counterfactual`, () => {
+    const file = join(root, "fixtures", `ai-sdk-v7-${format}.jsonl`);
+    const r = audit([file]);
+    const price = new PriceTable().lookup("claude-sonnet-5-5")!;
+    const rate = price.cacheWrite5m! - price.cacheRead!;
+    for (const run of readOtlp(file)) {
+      const findings = r.findings.filter((f) => f.runId === run.id);
+      const busted = SDK_TOTALS[run.id.split("#")[1]!]?.read === 0;
+      assert.deepEqual(findings.map((f) => f.rule), busted ? ["cache-thrash"] : [], run.id);
+      if (!busted) continue;
+      // Each call would have read what the previous call cached; skip the reset and tiny losses.
+      let want = 0;
+      run.turns.forEach((t, i) => {
+        if (!i || t.contextReplacedBefore) return;
+        const p = run.turns[i - 1]!.call.tokens!;
+        const lost = (p.cacheRead ?? 0) + (p.cacheWriteOther ?? 0) - (t.call.tokens!.cacheRead ?? 0);
+        if (lost >= 1024) want += (Math.min(lost, t.call.tokens!.cacheWriteOther ?? 0) * rate) / 1e6;
+      });
+      assert.ok(want > 0);
+      assert.ok(Math.abs(findings[0]!.avoidableUsd! - want) < 1e-9, `${findings[0]!.avoidableUsd} vs ${want}`);
+    }
+  });
+}

@@ -135,6 +135,16 @@ Accepts a single export request, an array of them, or JSONL with one per line (t
 - Tool calls: `execute_tool` spans. Duplicate and reread rules need `gen_ai.tool.call.arguments`, which most instrumentations only record with content capture turned on.
 - Provider: read from `gen_ai.provider.name` or the older `gen_ai.system`, then checked against `server.address` and the model name. Calls to DeepSeek, Qwen and others made through an OpenAI-compatible client are reported as `openai` by the instrumentation and get relabeled, so they are priced correctly.
 - `gen_ai.usage.input_tokens` is taken as the total prompt; `cache_read` / `cache_creation` input tokens are subtracted when present. DeepSeek's own cache field is read if an instrumentation records it.
+- A span with error status and no usage is a failed call. A run whose calls all failed is counted apart, not as a $0 run.
+- One trace can hold several conversations (a second agent call, a sub-agent). A call whose prompt is much smaller than the previous one (under 80%, and at least 1,024 tokens less) starts a new context, so repeat and cache rules start over there.
+
+### Vercel AI SDK
+
+Checked against AI SDK 7.0.157 with `@ai-sdk/otel` 1.0.157, on real captures (`fixtures/ai-sdk-v7-*.jsonl`).
+
+- The default `OpenTelemetry` integration emits GenAI spans (`invoke_agent`, `chat`, `execute_tool`), read as above, cache reads and writes included.
+- `LegacyOpenTelemetry` emits `ai.*` spans: one model call per `ai.generateText.doGenerate` / `ai.streamText.doStream` span (`ai.operationId`), cache reads and writes from `ai.usage.inputTokenDetails`, tool calls from `ai.toolCall` spans. AI SDK 6 and earlier emit this format by default; that has not been checked on a capture yet.
+- Retries inside the SDK are one span: an attempt that failed before a retry leaves no trace of its own, so its cost can't be counted.
 
 ## Related tools
 
@@ -143,13 +153,13 @@ Accepts a single export request, an array of them, or JSONL with one per line (t
 
 ## Status
 
-v0.1. Working: Claude Code logs, gen_ai OTLP, three rules, table / JSON / Markdown output, `record` for OTLP/HTTP JSON.
+v0.1. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), three rules, cost per run, table / JSON / Markdown output, `record` for OTLP/HTTP JSON.
 
 Next:
 
 - More rules: `oversized-tool-result`, `retry-loop`, `context-growth`
 - Protobuf in `burnlint record`, so agents that cannot switch to `http/json` can be recorded too
-- Dialect mappers checked against real exports: Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans, OpenInference, Vercel AI SDK
+- Dialect mappers checked against real exports: Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans, OpenInference, OpenAI Agents SDK, LangGraph
 - `burnlint diff` for comparing a branch against a baseline in CI
 
 ## Development
@@ -160,6 +170,8 @@ npm test
 ```
 
 `scripts/gen-record-fixture.mjs` regenerates the `record` fixture by sending spans through the official OpenTelemetry JS OTLP exporter to a running `burnlint record` (package versions are pinned in the script).
+
+`fixtures/ai-sdk-v7-*.jsonl` are real runs of `bench/ai-sdk/agent.mjs` (a read-only code-review agent on Claude Sonnet 5.5), captured with `burnlint record` and redacted with `scripts/redact-capture.mjs`: prompts and model output are removed, tool results replaced by filler of the same length (equal where they were equal).
 
 `scripts/gen-otel-deepseek-fixture.py` regenerates the OTel fixture by running the official `opentelemetry-instrumentation-openai-v2` against a local mock DeepSeek server (needs `openai`, `opentelemetry-sdk`, `opentelemetry-instrumentation-openai-v2==2.3b0`, `opentelemetry-exporter-otlp-proto-common`, `wrapt<2`).
 

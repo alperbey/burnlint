@@ -13,6 +13,19 @@
 // - gen_ai.usage.input_tokens is the total prompt, including cached tokens.
 //   When cache attributes are absent, cache usage is unknown (not zero) and
 //   the call is priced as if nothing was cached, which is an upper bound.
+//
+// Vercel AI SDK `ai.*` spans, checked against ai 7.0.157 with
+// LegacyOpenTelemetry from @ai-sdk/otel 1.0.157 (the format AI SDK 6 and
+// earlier emit by default is expected to match, not yet checked on a capture):
+// - One model call is an `ai.generateText.doGenerate` / `ai.streamText.doStream`
+//   (or generateObject / streamObject) span, named in `ai.operationId`. The
+//   parent `ai.generateText` sums its steps and carries no gen_ai.usage.
+// - gen_ai.usage.input_tokens is the total prompt, as above; cache reads and
+//   writes are only in ai.usage.inputTokenDetails.cacheReadTokens and
+//   .cacheWriteTokens (5m and 1h writes not split).
+// - A failed call is a model span with error status and no usage. Retries
+//   inside the SDK are one span: "Failed after 3 attempts" on a single span.
+// - Tool calls are `ai.toolCall` spans: ai.toolCall.name/.id/.args/.result.
 
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
@@ -142,11 +155,14 @@ export function readOtlp(file: string): Run[] {
 }
 
 const LLM_OPS = new Set(["chat", "generate_content", "text_completion", "responses", "inference"]);
+/** Vercel AI SDK `ai.*` spans that are one model call. */
+const AI_SDK_CALL_OPS = new Set(["ai.generateText.doGenerate", "ai.streamText.doStream", "ai.generateObject.doGenerate", "ai.streamObject.doStream"]);
 
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 
 function isLlm(s: Span): boolean {
+  if (AI_SDK_CALL_OPS.has(str(s.attrs["ai.operationId"]) ?? "")) return true;
   const op = str(s.attrs["gen_ai.operation.name"]);
   if (op && LLM_OPS.has(op)) return true;
   if (op === "execute_tool") return false;
@@ -154,7 +170,11 @@ function isLlm(s: Span): boolean {
 }
 
 function isTool(s: Span): boolean {
-  return str(s.attrs["gen_ai.operation.name"]) === "execute_tool" || str(s.attrs["gen_ai.tool.name"]) != null;
+  return (
+    str(s.attrs["gen_ai.operation.name"]) === "execute_tool" ||
+    str(s.attrs["gen_ai.tool.name"]) != null ||
+    str(s.attrs["ai.operationId"]) === "ai.toolCall"
+  );
 }
 
 function buildRun(list: Span[], file: string, traceId: string): Run {
@@ -185,9 +205,9 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
 
   const turns: Turn[] = llm.map((s, index) => {
     const a = s.attrs;
-    const model = str(a["gen_ai.response.model"]) ?? str(a["gen_ai.request.model"]);
+    const model = str(a["gen_ai.response.model"]) ?? str(a["gen_ai.request.model"]) ?? str(a["ai.model.id"]);
     const prov = resolveProvider({
-      reported: str(a["gen_ai.provider.name"]) ?? str(a["gen_ai.system"]),
+      reported: str(a["gen_ai.provider.name"]) ?? str(a["gen_ai.system"]) ?? str(a["ai.model.provider"]),
       model,
       host: str(a["server.address"]),
     });
@@ -204,15 +224,18 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
       const cacheRead =
         num(a["gen_ai.usage.cache_read.input_tokens"]) ??
         num(a["gen_ai.usage.cache_read_input_tokens"]) ??
-        num(a["deepseek.prompt_cache_hit_tokens"]);
+        num(a["deepseek.prompt_cache_hit_tokens"]) ??
+        num(a["ai.usage.inputTokenDetails.cacheReadTokens"]);
       const cacheWrite =
-        num(a["gen_ai.usage.cache_creation.input_tokens"]) ?? num(a["gen_ai.usage.cache_creation_input_tokens"]);
+        num(a["gen_ai.usage.cache_creation.input_tokens"]) ??
+        num(a["gen_ai.usage.cache_creation_input_tokens"]) ??
+        num(a["ai.usage.inputTokenDetails.cacheWriteTokens"]);
       t.cacheKnown = cacheRead != null || cacheWrite != null;
       t.cacheRead = cacheRead;
       t.cacheWriteOther = cacheWrite;
       t.input = total == null ? null : Math.max(0, total - (cacheRead ?? 0) - (cacheWrite ?? 0));
       t.output = output;
-      t.reasoning = num(a["gen_ai.usage.reasoning.output_tokens"]);
+      t.reasoning = num(a["gen_ai.usage.reasoning.output_tokens"]) ?? num(a["ai.usage.outputTokenDetails.reasoningTokens"]);
       if (!t.cacheKnown) cacheUnknown++;
       tokens = t;
     } else if (s.error) {
@@ -222,7 +245,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
     }
 
     const call: ModelCall = {
-      id: str(a["gen_ai.response.id"]) ?? s.spanId,
+      id: str(a["gen_ai.response.id"]) ?? str(a["ai.response.id"]) ?? s.spanId,
       ts: nanoToIso(s.start),
       model,
       provider: prov.provider,
@@ -270,7 +293,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
   return {
     id: `${basename(file)}#${traceId.slice(0, 12)}`,
     source: "otlp",
-    dialect: "gen_ai",
+    dialect: list.some((s) => str(s.attrs["ai.operationId"])?.startsWith("ai.")) ? "ai-sdk" : "gen_ai",
     file,
     agent: service,
     turns,
@@ -306,8 +329,8 @@ function markContextResets(turns: Turn[]): number {
 
 function toolFromSpan(s: Span): ToolCall {
   const a = s.attrs;
-  const name = str(a["gen_ai.tool.name"]) ?? s.name.replace(/^execute_tool\s+/, "");
-  const rawArgs = a["gen_ai.tool.call.arguments"];
+  const name = str(a["gen_ai.tool.name"]) ?? str(a["ai.toolCall.name"]) ?? s.name.replace(/^execute_tool\s+/, "");
+  const rawArgs = a["gen_ai.tool.call.arguments"] ?? a["ai.toolCall.args"];
   let input: unknown = rawArgs;
   if (typeof rawArgs === "string") {
     try {
@@ -317,16 +340,16 @@ function toolFromSpan(s: Span): ToolCall {
     }
   }
   const { kind, target } = classifyTool(name, input);
-  const result = a["gen_ai.tool.call.result"];
+  const result = a["gen_ai.tool.call.result"] ?? a["ai.toolCall.result"];
   return {
-    id: str(a["gen_ai.tool.call.id"]) ?? s.spanId,
+    id: str(a["gen_ai.tool.call.id"]) ?? str(a["ai.toolCall.id"]) ?? s.spanId,
     ts: nanoToIso(s.start),
     name,
     input,
     inputKey: input === undefined ? undefined : stableKey(input),
     kind,
     target,
-    isError: s.attrs["error.type"] != null ? true : undefined,
+    isError: s.attrs["error.type"] != null || s.error ? true : undefined,
     resultTokens:
       result === undefined ? undefined : estimateTokens(typeof result === "string" ? result : JSON.stringify(result)),
     resultKey: result === undefined ? undefined : contentKey(result),
