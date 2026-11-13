@@ -82,14 +82,19 @@ export interface Run {
   /** Telemetry dialect, e.g. "gen_ai". */
   dialect?: string;
   file: string;
-  /** Sub-agent / sidechain label when the run is not the main thread. */
+  /** Sub-agent / sidechain label when the run is not the main thread; service name for OTLP. */
   agent?: string;
+  /** Session the run belongs to (a sub-agent's is its parent's). */
+  session?: string;
+  /** Last segment of the folder the agent worked in, when the source records it. */
+  project?: string;
   turns: Turn[];
   /** Notes about data quality, shown in the report. */
   notes: string[];
 }
 
-export type Severity = "high" | "medium" | "low";
+/** "info": a trade-off, or nothing to gain. Never fails `--fail-on`. */
+export type Severity = "high" | "medium" | "low" | "info";
 
 /**
  * What acting on a finding would take away from the model.
@@ -108,7 +113,10 @@ export interface Finding {
   file: string;
   /** Turn indexes involved. */
   turns: number[];
+  /** One line. Per-turn detail goes in `details`. */
   message: string;
+  /** Per-occurrence lines, shown with --verbose. */
+  details?: string[];
   /** What the pattern cost, USD. null when it can't be priced. */
   costUsd: number | null;
   /** Tokens involved (all kinds). null when unknown. */

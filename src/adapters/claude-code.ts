@@ -25,6 +25,7 @@ interface Line {
   isMeta?: boolean;
   isCompactSummary?: boolean;
   sessionId?: string;
+  cwd?: string;
   timestamp?: string;
   isSidechain?: boolean;
   agentId?: string;
@@ -60,6 +61,8 @@ export function readClaudeCode(file: string): Run[] {
   const lines = readFileSync(file, "utf8").split("\n");
   const groups = new Map<string, { agent?: string; records: Line[] }>();
   let bad = 0;
+  let sessionId: string | undefined;
+  let cwd: string | undefined;
   for (const raw of lines) {
     if (!raw.trim()) continue;
     let d: Line;
@@ -69,6 +72,8 @@ export function readClaudeCode(file: string): Run[] {
       bad++;
       continue;
     }
+    sessionId ??= typeof d.sessionId === "string" ? d.sessionId : undefined;
+    cwd ??= typeof d.cwd === "string" && d.cwd ? d.cwd : undefined;
     const compaction = d.type === "system" && d.subtype === "compact_boundary";
     if (d.type !== "assistant" && d.type !== "user" && !compaction) continue;
     const key = d.isSidechain ? `sidechain:${d.agentId ?? "agent"}` : "main";
@@ -80,6 +85,9 @@ export function readClaudeCode(file: string): Run[] {
   const runs: Run[] = [];
   for (const [key, g] of groups) {
     const run = buildRun(g.records, file, key === "main" ? session : `${session}#${g.agent}`, g.agent);
+    // A sub-agent's log carries its parent's session id.
+    run.session = sessionId ?? session;
+    if (cwd) run.project = basename(cwd.replace(/[\\/]+$/, "")) || cwd;
     if (bad) run.notes.push(`${bad} unparseable line(s) skipped`);
     if (run.turns.length) runs.push(run);
   }

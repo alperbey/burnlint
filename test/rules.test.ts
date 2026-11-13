@@ -6,7 +6,7 @@ import { modelCandidates, PriceTable } from "../src/pricing.js";
 import { cacheThrash } from "../src/rules/cache-thrash.js";
 import { duplicateToolCall } from "../src/rules/duplicate-tool-call.js";
 import { rereadUnchanged } from "../src/rules/reread-unchanged.js";
-import { defaultConfig } from "../src/rules/types.js";
+import { defaultConfig, formatDuration } from "../src/rules/types.js";
 import { classifyTool, contentKey, isVolatileTool, mayBeSameFile, stableKey } from "../src/tools.js";
 
 const ctx = { prices: new PriceTable(), config: defaultConfig };
@@ -201,7 +201,9 @@ test("cache-thrash: expiry is savable only net of the keep-alive that would have
   assert.ok(Math.abs(f!.costUsd! - rewrite) < 1e-9);
   assert.ok(Math.abs(f!.avoidableUsd! - (rewrite - 2 * ping)) < 1e-9);
   assert.equal(f!.fix, "no-loss");
-  assert.match(f!.message, /covered 1 of 1 and saved \$0\.46/);
+  assert.equal(f!.message, "1 cache rewrite after 2h30m idle, within the 12h keep-alive");
+  assert.equal(f!.severity, "medium"); // severity follows the $0.46 saving, not the $0.52 cost
+  assert.deepEqual(f!.details, ["turn 2 · 91k tokens · $0.52 · idle 2h30m"]);
 });
 
 test("cache-thrash: a break longer than the keep-alive pays for the pings and the rewrite", () => {
@@ -212,7 +214,9 @@ test("cache-thrash: a break longer than the keep-alive pays for the pings and th
   const [f] = cacheThrash.check(run, ctx);
   // 12h of pings every 55 min = 13, none of which prevented the rewrite.
   assert.ok(Math.abs(f!.avoidableUsd! - -(13 * 90005 * 0.3) / 1e6) < 1e-9);
-  assert.match(f!.message, /covered 0 of 1 but cost more than it saved/);
+  assert.match(f!.message, /after 13h idle, beyond the 12h keep-alive/);
+  // Nothing to gain: shown, but never fails --fail-on.
+  assert.equal(f!.severity, "info");
   const longer = cacheThrash.check(run, { ...ctx, config: { ...ctx.config, keepAliveHours: 24 } })[0]!;
   assert.ok(longer.avoidableUsd! > 0);
 });
@@ -233,7 +237,8 @@ test("cache-thrash: a model switch is a trade-off, reported apart from other cau
       [[1], "trade-off", true],
     ],
   );
-  assert.match(f[1]!.message, /model switched/);
+  assert.match(f[1]!.message, /after a model switch/);
+  assert.equal(f[1]!.severity, "info");
 });
 
 test("cache-thrash: the first call after compaction is not flagged", () => {
@@ -253,7 +258,7 @@ test("cache-thrash: expiry is judged against the TTL the call wrote with", () =>
       ]),
       ctx,
     )[0]!.message;
-  assert.match(at("w5"), /cache likely expired/);
+  assert.match(at("w5"), /after 20m idle/);
   assert.match(at("w1"), /prompt prefix changed/);
 });
 
@@ -272,8 +277,7 @@ test("cache-thrash: long gap is reported as expiry", () => {
     { read: 0, w1: 91000, ts: "2026-11-01T12:30:00Z" },
   ]);
   const f = cacheThrash.check(run, ctx);
-  assert.match(f[0]!.message, /expired/);
-  assert.match(f[0]!.message, /2h30m/);
+  assert.match(f[0]!.message, /after 2h30m idle/);
 });
 
 test("cache-thrash: calls with unknown cache usage are skipped", () => {
@@ -288,4 +292,8 @@ test("model name variants resolve to priced entries", () => {
     assert.ok(p.lookup(m), `no price for ${m}`);
   }
   assert.deepEqual(modelCandidates("deepseek/deepseek-chat").slice(0, 2), ["deepseek/deepseek-chat", "deepseek-chat"]);
+});
+
+test("idle times read as minutes, hours or days", () => {
+  assert.deepEqual([16, 150, 180, 2383, 9840, 128290].map(formatDuration), ["16m", "2h30m", "3h", "39h43m", "6d20h", "89d"]);
 });

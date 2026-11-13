@@ -11,6 +11,8 @@ export interface RunSummary {
   file: string;
   source: string;
   agent?: string;
+  session?: string;
+  project?: string;
   calls: number;
   pricedCalls: number;
   costUsd: number;
@@ -20,7 +22,10 @@ export interface RunSummary {
 
 export interface AuditResult {
   files: number;
+  /** Files that should have been readable and weren't, with the reason. */
   skippedFiles: string[];
+  /** Files found while scanning a folder that aren't traces (an agent's settings, titles, ...). */
+  ignoredFiles: string[];
   runs: RunSummary[];
   findings: Finding[];
   totalCostUsd: number;
@@ -28,7 +33,36 @@ export interface AuditResult {
   findingsCostUsd: number;
   /** What no-loss fixes would have saved, net of their own cost. Trade-offs are not counted. */
   avoidableUsd: number;
+  /** Cost per unit of work. null when nothing was audited. */
+  perRun: PerRun | null;
+  /** Spend and avoidable spend at a stated volume. Only when one was given. */
+  projection?: Projection;
   prices: { source: string; retrieved: string };
+}
+
+/**
+ * A run here is a unit of work: a Claude Code session together with its
+ * sub-agents, or one OTLP trace. Sub-agents are part of the task that started
+ * them, so they don't count as runs of their own.
+ */
+export interface PerRun {
+  count: number;
+  meanUsd: number;
+  medianUsd: number;
+  /** Nearest-rank 90th percentile. */
+  p90Usd: number;
+  maxUsd: number;
+  avoidableUsd: number;
+  /** Avoidable spend as a share of all spend, 0-1. */
+  avoidableShare: number;
+  /** Runs with calls that couldn't be priced: their cost is a lower bound. */
+  incomplete: number;
+}
+
+export interface Projection {
+  runsPerMonth: number;
+  spendUsd: number;
+  avoidableUsd: number;
 }
 
 export interface AuditOptions {
@@ -36,9 +70,11 @@ export interface AuditOptions {
   config?: Partial<RuleConfig>;
   /** Only run these rule ids. */
   only?: string[];
+  /** Expected volume, to project spend and avoidable spend to a month. */
+  runsPerMonth?: number;
 }
 
-const SEVERITY_RANK: Record<Severity, number> = { high: 3, medium: 2, low: 1 };
+const SEVERITY_RANK: Record<Severity, number> = { high: 3, medium: 2, low: 1, info: 0 };
 export const severityRank = (s: Severity) => SEVERITY_RANK[s];
 
 export function collectFiles(paths: string[]): string[] {
@@ -79,7 +115,9 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
   const active = opts.only?.length ? rules.filter((r) => opts.only!.includes(r.id)) : rules;
 
   const files = collectFiles(paths);
+  const named = new Set(paths.filter((p) => statSync(p).isFile()));
   const skippedFiles: string[] = [];
+  const ignoredFiles: string[] = [];
   const summaries: RunSummary[] = [];
   const findings: Finding[] = [];
 
@@ -92,7 +130,8 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
       continue;
     }
     if (!runs) {
-      skippedFiles.push(`${file} (unrecognized format)`);
+      if (named.has(file)) skippedFiles.push(`${file} (unrecognized format)`);
+      else ignoredFiles.push(file);
       continue;
     }
     for (const run of runs) {
@@ -113,6 +152,8 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
         file: run.file,
         source: run.source,
         agent: run.agent,
+        session: run.session,
+        project: run.project,
         calls: run.turns.length,
         pricedCalls: priced,
         costUsd: cost,
@@ -124,17 +165,54 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
   }
 
   findings.sort(
-    (a, b) => severityRank(b.severity) - severityRank(a.severity) || (b.costUsd ?? -1) - (a.costUsd ?? -1),
+    (a, b) =>
+      severityRank(b.severity) - severityRank(a.severity) ||
+      (b.avoidableUsd ?? -Infinity) - (a.avoidableUsd ?? -Infinity) ||
+      (b.costUsd ?? -1) - (a.costUsd ?? -1),
   );
 
+  const totalCostUsd = summaries.reduce((s, r) => s + r.costUsd, 0);
+  const avoidableUsd = findings.reduce((s, f) => s + (f.avoidableUsd ?? 0), 0);
+  const perRun = perRunCosts(summaries, totalCostUsd, avoidableUsd);
+  const n = opts.runsPerMonth;
   return {
     files: files.length,
     skippedFiles,
+    ignoredFiles,
     runs: summaries,
     findings,
-    totalCostUsd: summaries.reduce((s, r) => s + r.costUsd, 0),
+    totalCostUsd,
     findingsCostUsd: findings.reduce((s, f) => s + (f.costUsd ?? 0), 0),
-    avoidableUsd: findings.reduce((s, f) => s + (f.avoidableUsd ?? 0), 0),
+    avoidableUsd,
+    perRun,
+    ...(n != null && perRun ? { projection: { runsPerMonth: n, spendUsd: perRun.meanUsd * n, avoidableUsd: perRun.avoidableUsd * n } } : {}),
     prices: { source: prices.source, retrieved: prices.retrieved },
+  };
+}
+
+/** The unit a run summary belongs to: its session (sub-agents share their parent's), else itself. */
+export const unitOf = (r: RunSummary) => r.session ?? r.id;
+
+function perRunCosts(summaries: RunSummary[], total: number, avoidable: number): PerRun | null {
+  const units = new Map<string, { cost: number; incomplete: boolean }>();
+  for (const r of summaries) {
+    const u = units.get(unitOf(r)) ?? { cost: 0, incomplete: false };
+    u.cost += r.costUsd;
+    u.incomplete ||= r.pricedCalls < r.calls;
+    units.set(unitOf(r), u);
+  }
+  if (!units.size) return null;
+  const costs = [...units.values()].map((u) => u.cost).sort((a, b) => a - b);
+  const count = costs.length;
+  const mid = count >> 1;
+  return {
+    count,
+    meanUsd: total / count,
+    medianUsd: count % 2 ? costs[mid]! : (costs[mid - 1]! + costs[mid]!) / 2,
+    p90Usd: costs[Math.ceil(0.9 * count) - 1]!,
+    maxUsd: costs[count - 1]!,
+    avoidableUsd: avoidable / count,
+    avoidableShare: total > 0 ? avoidable / total : 0,
+    incomplete: [...units.values()].filter((u) => u.incomplete).length,
   };
 }

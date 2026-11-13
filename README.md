@@ -1,8 +1,8 @@
 # burnlint
 
-Lint agent traces for wasted tokens and money.
+What do your agent's runs cost, and how much of that was avoidable?
 
-Usage trackers tell you how much an agent spent. burnlint points at the spend that was avoidable: repeated tool calls, files read twice, prompt caches rebuilt mid-run. Each finding comes with a severity, what the pattern cost, and how much of that a fix could have saved without taking anything away from the model. `--fail-on` turns it into a CI check.
+burnlint reads agent traces and reports cost per run (typical, 90th percentile, at your monthly volume) and the spend that was avoidable: repeated tool calls, files read twice, prompt caches rebuilt mid-run. Each finding comes with a severity, what the pattern cost, and how much of that a fix could have saved without taking anything away from the model. `--fail-on` turns it into a CI check.
 
 It works on any agent, not one framework:
 
@@ -14,32 +14,41 @@ Everything runs locally. No network calls, and message content is never printed.
 ```
 npx burnlint audit                      # your Claude Code history
 npx burnlint audit traces.json          # an OTLP/JSON export
+npx burnlint audit ./traces --runs-per-month 20000  # what it comes to at your volume
 npx burnlint audit ./traces --fail-on high -f md   # CI, Markdown for PR comments
 npx burnlint record -o run.jsonl        # capture OTLP traces from a running agent
 ```
 
 ## Example
 
-From a real Claude Code session:
+From a real Claude Code session (project name and session id replaced):
 
 ```
-burnlint  1 run(s) in 1 file(s)  ·  total $5.08  ·  in findings $1.22  ·  avoidable $1.22
+burnlint  1 run in 1 file
 
-SEV   RULE           COST  SAVABLE   TOKENS  FINDING
-high  cache-thrash  $1.22    $1.22  156,248  1 cache rewrite(s), 156,248 tokens, prompt prefix changed between calls (turn 66: 156,248 tokens)
+  spent        $5.08   $5.08 per run · median $5.08 · p90 $5.08 · max $5.08
+  in findings  $1.22   1 finding
+  avoidable    $1.22   $1.22 per run, 24.0% of spend, without taking anything away from the model
+
+myproject 3f2a9c1e  $1.22 savable of $1.22
+  high  $1.22  $1.22  cache-thrash  1 cache rewrite after the prompt prefix changed
 ```
 
-The session was resumed in a new environment, which changed the system prompt and forced the whole 156k-token context to be written to cache again at the 1-hour rate. That one call was a quarter of the session's cost.
+The session was resumed in a new environment, which changed the system prompt and forced the whole 156k-token context to be written to cache again at the 1-hour rate. That one call was a quarter of the session's cost. `-v` lists each occurrence (`turn 66 · 156k tokens · $1.22`) and the log file.
+
+A run is one unit of agent work: an OTLP trace, or a Claude Code session together with the sub-agents it started. The header gives the cost per run as a mean, median, 90th percentile and maximum, and avoidable spend per run and as a share of the total. With `--runs-per-month <n>` it adds what both come to in a month at that volume (mean cost per run × n).
+
+Findings are grouped by session (or trace), the one where fixes would save most first. Each line has the severity, what fixing it would save, what it cost, the rule and what happened. In a terminal, long lines wrap to its width; piped, each finding stays on one line.
 
 From an agent calling DeepSeek through the OpenAI client, traced with the official OpenTelemetry instrumentation (`fixtures/otel-deepseek-via-openai.json`):
 
 ```
-SEV  RULE                 COST  SAVABLE  TOKENS  FINDING
-low  reread-unchanged  $0.0004  $0.0004   1,350  src/app.py read 2x with no change in between (turns 1, 2)
+deepseek-demo-agent 5f017722  $0.0004 savable of $0.0004
+  low  $0.0004  $0.0004  reread-unchanged  src/app.py read 2x with no change in between (turns 1, 2)
 
 Notes
-  - 3 call(s) relabeled by model/server: openai -> deepseek
-  - 3 call(s) report no cache usage; their cost is an upper bound (cached tokens priced at full rate)
+  - deepseek-demo-agent 5f017722: 3 call(s) relabeled by model/server: openai -> deepseek
+  - deepseek-demo-agent 5f017722: 3 call(s) report no cache usage; their cost is an upper bound (cached tokens priced at full rate)
 ```
 
 ## Recording a running agent
@@ -95,7 +104,7 @@ Findings name the tool and the turns, or the file path. They never include tool 
 
 Exit codes: `0` audited, `1` a finding at or above `--fail-on`, `2` bad options or nothing to audit (no agent runs found in the given paths).
 
-Severity is set by cost: `high` from $1, `medium` from $0.10 (change with `--high-usd` / `--medium-usd`).
+Severity is set by what fixing the finding would save: `high` from $1, `medium` from $0.10 (change with `--high-usd` / `--medium-usd`), `low` below that. Trade-offs, and fixes that would save nothing (an idle break longer than the keep-alive), are `info`: shown, but never failing `--fail-on`.
 
 ## How costs are calculated
 

@@ -70,3 +70,11 @@ test("nothing to audit is an error, not a pass", () => {
   assert.equal(asJson.status, 2);
   assert.equal(JSON.parse(asJson.stdout).runs.length, 0);
 });
+
+test("--runs-per-month must be a volume above zero", () => {
+  assert.equal(run("audit", fixture, "--runs-per-month", "0").status, 2);
+  assert.equal(run("audit", fixture, "--runs-per-month", "lots").status, 2);
+  const ok = run("audit", fixture, "--runs-per-month", "10,000");
+  assert.equal(ok.status, 0);
+  assert.match(ok.stdout, /per month .* at 10,000 runs/);
+});

@@ -60,7 +60,7 @@ export const rereadUnchanged: Rule = {
       );
       findings.push({
         rule: this.id,
-        severity: severityFor(cost, ctx.config),
+        severity: severityFor("no-loss", cost, ctx.config),
         runId: run.id,
         file: run.file,
         turns: g.turns,

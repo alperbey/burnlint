@@ -55,7 +55,7 @@ export const duplicateToolCall: Rule = {
       const turns = [g.first, ...g.repeats.map((r) => r.turn)];
       findings.push({
         rule: this.id,
-        severity: severityFor(cost, ctx.config),
+        severity: severityFor("no-loss", cost, ctx.config),
         runId: run.id,
         file: run.file,
         turns,

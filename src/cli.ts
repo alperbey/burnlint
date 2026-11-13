@@ -22,12 +22,13 @@ Inputs (detected per file):
 
 Options:
   -f, --format <table|json|md>   Output format (default: table)
-      --fail-on <high|medium|low>  Exit 1 if any finding is at or above this severity
+      --fail-on <high|medium|low>  Exit 1 if any finding is at or above this severity (info never fails)
       --rule <id>                Only run this rule (repeatable)
       --prices <file.json>       Price overrides: { "model-id": { "input": 3, "output": 15, ... } } in USD per 1M tokens
       --high-usd <n>             Cost for high severity (default 1)
       --medium-usd <n>           Cost for medium severity (default 0.1)
-  -v, --verbose                  Show all notes and skipped files
+      --runs-per-month <n>       Project spend and avoidable spend to this many runs a month
+  -v, --verbose                  Show each occurrence, file paths and all notes
   -h, --help
 
 Record:
@@ -44,7 +45,7 @@ const err = (line: string) => process.stderr.write(line + "\n");
 
 /** Options each command takes. Anything else on the command line is refused, not ignored. */
 const COMMAND_OPTIONS: Record<string, string[]> = {
-  audit: ["format", "fail-on", "rule", "prices", "high-usd", "medium-usd", "verbose"],
+  audit: ["format", "fail-on", "rule", "prices", "high-usd", "medium-usd", "runs-per-month", "verbose"],
   record: ["out", "port", "verbose"],
   rules: [],
 };
@@ -132,6 +133,7 @@ async function main(argv: string[]): Promise<number> {
       prices: { type: "string" },
       "high-usd": { type: "string" },
       "medium-usd": { type: "string" },
+      "runs-per-month": { type: "string" },
       out: { type: "string", short: "o" },
       port: { type: "string" },
       verbose: { type: "boolean", short: "v", default: false },
@@ -180,6 +182,12 @@ async function main(argv: string[]): Promise<number> {
     err(`unknown rule: ${unknownRules.join(", ")} (rules: ${rules.map((r) => r.id).join(", ")})`);
     return 2;
   }
+  const rawVolume = values["runs-per-month"];
+  const runsPerMonth = rawVolume === undefined ? undefined : Number(rawVolume.replace(/[_,]/g, ""));
+  if (runsPerMonth !== undefined && (rawVolume!.trim() === "" || !Number.isFinite(runsPerMonth) || runsPerMonth <= 0)) {
+    err(`--runs-per-month must be a number above zero, got "${rawVolume}"`);
+    return 2;
+  }
   const highUsd = usdOption("high-usd", values["high-usd"]);
   const mediumUsd = usdOption("medium-usd", values["medium-usd"]);
   if ((mediumUsd ?? defaultConfig.mediumUsd) > (highUsd ?? defaultConfig.highUsd)) {
@@ -214,13 +222,17 @@ async function main(argv: string[]): Promise<number> {
   if (highUsd !== undefined) config.highUsd = highUsd;
   if (mediumUsd !== undefined) config.mediumUsd = mediumUsd;
 
-  const result = audit(targets, { prices, config, only: values.rule });
+  const result = audit(targets, { prices, config, only: values.rule, runsPerMonth });
 
   if (format === "json") process.stdout.write(renderJson(result) + "\n");
   else if (format === "md") process.stdout.write(renderMarkdown(result) + "\n");
   else
     process.stdout.write(
-      renderTable(result, { color: process.stdout.isTTY && !process.env.NO_COLOR, verbose: values.verbose }) + "\n",
+      renderTable(result, {
+        color: process.stdout.isTTY && !process.env.NO_COLOR,
+        verbose: values.verbose,
+        width: process.stdout.isTTY ? process.stdout.columns : undefined,
+      }) + "\n",
     );
 
   // "No findings" must not pass a CI gate when there was nothing to check.

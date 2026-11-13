@@ -1,7 +1,7 @@
 import type { Finding, FixEffect, Run, Tokens } from "../model.js";
 import { cacheWriteTotal } from "../model.js";
 import type { Price } from "../pricing.js";
-import { severityFor, sumNullable, type Rule, type RuleContext } from "./types.js";
+import { compactTokens, formatDuration, severityFor, sumNullable, type Rule, type RuleContext } from "./types.js";
 
 /**
  * Turns (after the first) that write more to the prompt cache than they read
@@ -80,47 +80,52 @@ interface CacheEvent {
   keepAlive: { spent: number; covered: boolean } | null;
 }
 
-const CAUSES: Record<Cause, { text: string; fix: FixEffect }> = {
-  expired: { text: "cache likely expired between calls", fix: "no-loss" },
-  prefix: { text: "prompt prefix changed between calls", fix: "no-loss" },
-  "model-switch": { text: "model switched between calls", fix: "trade-off" },
-};
+const FIX: Record<Cause, FixEffect> = { expired: "no-loss", prefix: "no-loss", "model-switch": "trade-off" };
 
 function findingFor(run: Run, ctx: RuleContext, rule: string, cause: Cause, events: CacheEvent[]): Finding {
   const cost = sumNullable(events.map((e) => e.cost));
   const tokens = events.reduce((s, e) => s + e.written, 0);
-  const detail = events
-    .slice(0, 5)
-    .map((e) => {
-      const gap = cause === "expired" && e.gapMin != null ? `, ${formatGap(e.gapMin)} after previous call` : "";
-      return `turn ${e.turn + 1}: ${e.written.toLocaleString("en-US")} tokens${gap}`;
-    })
-    .join("; ");
-  const { text, fix } = CAUSES[cause];
+  const fix = FIX[cause];
+  const n = events.length;
+  const rewrites = `${n} cache rewrite${n === 1 ? "" : "s"}`;
+  const hours = ctx.config.keepAliveHours;
 
   let avoidable: number | null = null;
-  let note = "";
-  if (cause === "prefix") avoidable = cost;
+  let message: string;
   if (cause === "expired") {
     // Each event: a covered break saves the rewrite and pays for its pings; a longer one pays for both.
     avoidable = sumNullable(
       events.map((e) => (e.keepAlive == null || e.cost == null ? null : (e.keepAlive.covered ? e.cost : 0) - e.keepAlive.spent)),
     );
-    if (avoidable != null) {
-      const covered = events.filter((e) => e.keepAlive?.covered).length;
-      note =
-        `; keeping the cache warm for up to ${ctx.config.keepAliveHours}h would have covered ${covered} of ${events.length} ` +
-        (avoidable > 0 ? `and saved $${avoidable.toFixed(2)}` : `but cost more than it saved`);
+    const gaps = events.map((e) => e.gapMin!).sort((a, b) => a - b);
+    const covered = events.filter((e) => e.keepAlive?.covered).length;
+    if (n === 1) {
+      message = `${rewrites} after ${formatDuration(gaps[0]!)} idle, ${covered ? "within" : "beyond"} the ${hours}h keep-alive`;
+    } else {
+      const share = covered === n ? "all" : covered === 0 ? "none" : String(covered);
+      message = `${rewrites} after ${formatDuration(gaps[0]!)}–${formatDuration(gaps[n - 1]!)} idle, ${share} within the ${hours}h keep-alive`;
     }
+  } else if (cause === "prefix") {
+    avoidable = cost;
+    message = `${rewrites} after the prompt prefix changed`;
+  } else {
+    message = `${rewrites} after a model switch`;
   }
 
   return {
     rule,
-    severity: severityFor(cost, ctx.config),
+    severity: severityFor(fix, avoidable, ctx.config),
     runId: run.id,
     file: run.file,
     turns: events.map((e) => e.turn),
-    message: `${events.length} cache rewrite(s), ${tokens.toLocaleString("en-US")} tokens, ${text} (${detail}${events.length > 5 ? "; …" : ""})${note}`,
+    message,
+    details: events.map((e) => {
+      const parts = [`turn ${e.turn + 1}`, `${compactTokens(e.written)} tokens`];
+      if (e.cost != null) parts.push(`$${e.cost.toFixed(2)}`);
+      if (cause === "expired" && e.gapMin != null)
+        parts.push(`idle ${formatDuration(e.gapMin)}${e.keepAlive && !e.keepAlive.covered ? `, beyond keep-alive` : ""}`);
+      return parts.join(" · ");
+    }),
     costUsd: cost,
     tokens,
     fix,
@@ -154,10 +159,4 @@ function rewriteCost(t: Tokens, p: Price): number {
     ((t.cacheWrite5m ?? 0) * (w5 - read) + (t.cacheWrite1h ?? 0) * (w1 - read) + (t.cacheWriteOther ?? 0) * (w5 - read)) /
     1e6
   );
-}
-
-function formatGap(min: number): string {
-  if (min < 60) return `${Math.round(min)}m`;
-  const h = Math.floor(min / 60);
-  return `${h}h${Math.round(min - h * 60)}m`;
 }
