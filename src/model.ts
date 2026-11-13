@@ -91,6 +91,16 @@ export interface Run {
 
 export type Severity = "high" | "medium" | "low";
 
+/**
+ * What acting on a finding would take away from the model.
+ * - "no-loss": only what it already had (a repeated result, a rewrite of a
+ *   prefix it already had cached). Output is not expected to change.
+ * - "trade-off": the fix changes what the model sees or which model runs.
+ *   Quality may change and a trace can't show whether it would. Never counted
+ *   as avoidable.
+ */
+export type FixEffect = "no-loss" | "trade-off";
+
 export interface Finding {
   rule: string;
   severity: Severity;
@@ -99,10 +109,17 @@ export interface Finding {
   /** Turn indexes involved. */
   turns: number[];
   message: string;
-  /** Estimated avoidable cost in USD. null when it can't be priced. */
+  /** What the pattern cost, USD. null when it can't be priced. */
   costUsd: number | null;
-  /** Estimated avoidable tokens (all kinds). null when unknown. */
+  /** Tokens involved (all kinds). null when unknown. */
   tokens: number | null;
+  fix: FixEffect;
+  /**
+   * What the no-loss fix would have saved, net of what the fix itself costs.
+   * Negative when the fix would have cost more than it saved. null for
+   * trade-offs and for findings that can't be priced.
+   */
+  avoidableUsd: number | null;
 }
 
 export function emptyTokens(): Tokens {

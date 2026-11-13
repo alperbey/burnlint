@@ -35,6 +35,9 @@ test("duplicate-tool-call: identical calls flagged, key order ignored", () => {
   assert.deepEqual(f[0]!.turns, [0, 1]);
   // 2000 tokens written at $3.75/M, then read at $0.3/M for 1 later turn
   assert.ok(Math.abs(f[0]!.costUsd! - (2000 * 3.75 + 2000 * 0.3) / 1e6) < 1e-9);
+  // Dropping the repeat loses nothing the model didn't already have.
+  assert.equal(f[0]!.fix, "no-loss");
+  assert.equal(f[0]!.avoidableUsd, f[0]!.costUsd);
 });
 
 test("duplicate-tool-call: a write in between resets", () => {
@@ -181,6 +184,56 @@ test("cache-thrash: mid-run rewrite flagged with avoidable cost", () => {
   // sonnet-4-6: 5m write $3.75, read $0.30 -> 95000 * 3.45 / 1e6
   assert.ok(Math.abs(f[0]!.costUsd! - (95000 * 3.45) / 1e6) < 1e-9);
   assert.match(f[0]!.message, /prefix changed/);
+  assert.equal(f[0]!.fix, "no-loss");
+  assert.equal(f[0]!.avoidableUsd, f[0]!.costUsd);
+});
+
+test("cache-thrash: expiry is savable only net of the keep-alive that would have prevented it", () => {
+  const run = cacheRun([
+    { read: 0, w1: 90000, ts: "2026-11-01T10:00:00Z" },
+    { read: 0, w1: 91000, ts: "2026-11-01T12:30:00Z" },
+  ]);
+  const [f] = cacheThrash.check(run, ctx);
+  // sonnet-4-6: 1h write $6, read $0.30. 150 min idle = 2 pings of the previous prompt
+  // (5 input + 90000 written), each a cache read.
+  const rewrite = (91000 * 5.7) / 1e6;
+  const ping = (90005 * 0.3) / 1e6;
+  assert.ok(Math.abs(f!.costUsd! - rewrite) < 1e-9);
+  assert.ok(Math.abs(f!.avoidableUsd! - (rewrite - 2 * ping)) < 1e-9);
+  assert.equal(f!.fix, "no-loss");
+  assert.match(f!.message, /covered 1 of 1 and saved \$0\.46/);
+});
+
+test("cache-thrash: a break longer than the keep-alive pays for the pings and the rewrite", () => {
+  const run = cacheRun([
+    { read: 0, w1: 90000, ts: "2026-11-01T10:00:00Z" },
+    { read: 0, w1: 91000, ts: "2026-11-01T23:00:00Z" },
+  ]);
+  const [f] = cacheThrash.check(run, ctx);
+  // 12h of pings every 55 min = 13, none of which prevented the rewrite.
+  assert.ok(Math.abs(f!.avoidableUsd! - -(13 * 90005 * 0.3) / 1e6) < 1e-9);
+  assert.match(f!.message, /covered 0 of 1 but cost more than it saved/);
+  const longer = cacheThrash.check(run, { ...ctx, config: { ...ctx.config, keepAliveHours: 24 } })[0]!;
+  assert.ok(longer.avoidableUsd! > 0);
+});
+
+test("cache-thrash: a model switch is a trade-off, reported apart from other causes", () => {
+  const run = cacheRun([
+    { read: 0, w1: 90000, ts: "2026-11-01T10:00:00Z" },
+    { read: 0, w1: 91000, ts: "2026-11-01T10:01:00Z" },
+    { read: 91000, w1: 1000, ts: "2026-11-01T10:02:00Z" },
+    { read: 0, w1: 92000, ts: "2026-11-01T10:03:00Z" },
+  ]);
+  for (const i of [1, 2, 3]) run.turns[i]!.call.model = "claude-opus-4-6";
+  const f = cacheThrash.check(run, ctx);
+  assert.deepEqual(
+    f.map((x) => [x.turns, x.fix, x.avoidableUsd === null]),
+    [
+      [[3], "no-loss", false],
+      [[1], "trade-off", true],
+    ],
+  );
+  assert.match(f[1]!.message, /model switched/);
 });
 
 test("cache-thrash: the first call after compaction is not flagged", () => {

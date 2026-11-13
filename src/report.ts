@@ -2,8 +2,8 @@ import { relative } from "node:path";
 import type { AuditResult } from "./audit.js";
 import type { Finding } from "./model.js";
 
-const usd = (n: number | null) =>
-  n == null ? "?" : n >= 100 ? `$${n.toFixed(0)}` : n >= 1 ? `$${n.toFixed(2)}` : n >= 0.01 ? `$${n.toFixed(3)}` : n > 0 ? `$${n.toFixed(4)}` : "$0";
+const usd = (n: number | null): string =>
+  n == null ? "?" : n < 0 ? `-${usd(-n)}` : n >= 100 ? `$${n.toFixed(0)}` : n >= 1 ? `$${n.toFixed(2)}` : n >= 0.01 ? `$${n.toFixed(3)}` : n > 0 ? `$${n.toFixed(4)}` : "$0";
 const int = (n: number | null) => (n == null ? "?" : n.toLocaleString("en-US"));
 const short = (p: string) => {
   const r = relative(process.cwd(), p);
@@ -20,16 +20,17 @@ export function renderTable(r: AuditResult, opts: { color?: boolean; verbose?: b
   const out: string[] = [];
 
   out.push(
-    `${c("1", "burnlint")}  ${r.runs.length} run(s) in ${r.files} file(s)  ·  total ${usd(r.totalCostUsd)}  ·  avoidable ${usd(r.findingsCostUsd)}`,
+    `${c("1", "burnlint")}  ${r.runs.length} run(s) in ${r.files} file(s)  ·  total ${usd(r.totalCostUsd)}  ·  in findings ${usd(r.findingsCostUsd)}  ·  avoidable ${usd(r.avoidableUsd)}`,
   );
   out.push("");
 
   if (!r.findings.length) {
     out.push("No findings.");
   } else {
-    const rows = r.findings.map((f) => [f.severity, f.rule, usd(f.costUsd), int(f.tokens), f.message, runLabel(f)]);
-    const w = [0, 1, 2, 3].map((i) => Math.max(...rows.map((row) => row[i]!.length), ["SEV", "RULE", "COST", "TOKENS"][i]!.length));
-    out.push(c("2", ["SEV".padEnd(w[0]!), "RULE".padEnd(w[1]!), "COST".padStart(w[2]!), "TOKENS".padStart(w[3]!), "FINDING"].join("  ")));
+    const rows = r.findings.map((f) => [f.severity, f.rule, usd(f.costUsd), savable(f), int(f.tokens), f.message, runLabel(f)]);
+    const heads = ["SEV", "RULE", "COST", "SAVABLE", "TOKENS"];
+    const w = heads.map((h, i) => Math.max(...rows.map((row) => row[i]!.length), h.length));
+    out.push(c("2", [...heads.map((h, i) => (i < 2 ? h.padEnd(w[i]!) : h.padStart(w[i]!))), "FINDING"].join("  ")));
     for (const row of rows) {
       out.push(
         [
@@ -37,7 +38,8 @@ export function renderTable(r: AuditResult, opts: { color?: boolean; verbose?: b
           row[1]!.padEnd(w[1]!),
           row[2]!.padStart(w[2]!),
           row[3]!.padStart(w[3]!),
-          row[4]! + c("2", `  [${row[5]}]`),
+          row[4]!.padStart(w[4]!),
+          row[5]! + c("2", `  [${row[6]}]`),
         ].join("  "),
       );
     }
@@ -55,24 +57,37 @@ export function renderTable(r: AuditResult, opts: { color?: boolean; verbose?: b
     if (shown.length < notes.length) out.push(c("2", `  - … ${notes.length - shown.length} more (use --verbose)`));
   }
   out.push("");
+  if (r.findings.length) out.push(c("2", SAVABLE_NOTE));
   out.push(c("2", `Costs are estimates. Prices: ${r.prices.source}, retrieved ${r.prices.retrieved}.`));
   return out.join("\n");
+}
+
+const SAVABLE_NOTE =
+  "Savable: what a fix that loses nothing the model already had would have saved, net of the fix's own cost. " +
+  "Trade-offs change what the model sees or which model runs; quality may change, so they are not counted as avoidable.";
+
+function savable(f: Finding): string {
+  return f.fix === "trade-off" ? "trade-off" : usd(f.avoidableUsd);
 }
 
 export function renderMarkdown(r: AuditResult): string {
   const out: string[] = [];
   out.push(`### burnlint`);
   out.push("");
-  out.push(`${r.runs.length} run(s) · total **${usd(r.totalCostUsd)}** · avoidable **${usd(r.findingsCostUsd)}**`);
+  out.push(
+    `${r.runs.length} run(s) · total **${usd(r.totalCostUsd)}** · in findings **${usd(r.findingsCostUsd)}** · avoidable **${usd(r.avoidableUsd)}**`,
+  );
   out.push("");
   if (!r.findings.length) {
     out.push("No findings.");
   } else {
-    out.push("| Severity | Rule | Cost | Tokens | Finding |");
-    out.push("|---|---|--:|--:|---|");
+    out.push("| Severity | Rule | Cost | Savable | Tokens | Finding |");
+    out.push("|---|---|--:|--:|--:|---|");
     for (const f of r.findings) {
-      out.push(`| ${f.severity} | \`${f.rule}\` | ${usd(f.costUsd)} | ${int(f.tokens)} | ${escapeMd(f.message)} |`);
+      out.push(`| ${f.severity} | \`${f.rule}\` | ${usd(f.costUsd)} | ${savable(f)} | ${int(f.tokens)} | ${escapeMd(f.message)} |`);
     }
+    out.push("");
+    out.push(`<sub>${SAVABLE_NOTE}</sub>`);
   }
   const notes = r.runs.flatMap((run) => run.notes);
   if (notes.length) {

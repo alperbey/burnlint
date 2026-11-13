@@ -62,6 +62,9 @@ export const duplicateToolCall: Rule = {
         message: `${g.name} called ${turns.length}x with identical input and result (turns ${turnList(turns)})`,
         costUsd: cost,
         tokens,
+        // The repeat returned what the model already had.
+        fix: "no-loss",
+        avoidableUsd: cost,
       });
     }
     return findings;

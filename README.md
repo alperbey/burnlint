@@ -2,7 +2,7 @@
 
 Lint agent traces for wasted tokens and money.
 
-Usage trackers tell you how much an agent spent. burnlint points at the spend that was avoidable: repeated tool calls, files read twice, prompt caches rebuilt mid-run. Each finding comes with a severity and an estimated dollar cost, and `--fail-on` turns it into a CI check.
+Usage trackers tell you how much an agent spent. burnlint points at the spend that was avoidable: repeated tool calls, files read twice, prompt caches rebuilt mid-run. Each finding comes with a severity, what the pattern cost, and how much of that a fix could have saved without taking anything away from the model. `--fail-on` turns it into a CI check.
 
 It works on any agent, not one framework:
 
@@ -23,10 +23,10 @@ npx burnlint record -o run.jsonl        # capture OTLP traces from a running age
 From a real Claude Code session:
 
 ```
-burnlint  1 run(s) in 1 file(s)  ·  total $5.08  ·  avoidable $1.22
+burnlint  1 run(s) in 1 file(s)  ·  total $5.08  ·  in findings $1.22  ·  avoidable $1.22
 
-SEV   RULE           COST   TOKENS  FINDING
-high  cache-thrash  $1.22  156,248  1 cache rewrite(s), 156,248 tokens, prompt prefix changed between calls (turn 66: 156,248 tokens)
+SEV   RULE           COST  SAVABLE   TOKENS  FINDING
+high  cache-thrash  $1.22    $1.22  156,248  1 cache rewrite(s), 156,248 tokens, prompt prefix changed between calls (turn 66: 156,248 tokens)
 ```
 
 The session was resumed in a new environment, which changed the system prompt and forced the whole 156k-token context to be written to cache again at the 1-hour rate. That one call was a quarter of the session's cost.
@@ -34,8 +34,8 @@ The session was resumed in a new environment, which changed the system prompt an
 From an agent calling DeepSeek through the OpenAI client, traced with the official OpenTelemetry instrumentation (`fixtures/otel-deepseek-via-openai.json`):
 
 ```
-SEV  RULE                 COST  TOKENS  FINDING
-low  reread-unchanged  $0.0004   1,350  src/app.py read 2x with no change in between (turns 1, 2)
+SEV  RULE                 COST  SAVABLE  TOKENS  FINDING
+low  reread-unchanged  $0.0004  $0.0004   1,350  src/app.py read 2x with no change in between (turns 1, 2)
 
 Notes
   - 3 call(s) relabeled by model/server: openai -> deepseek
@@ -69,11 +69,20 @@ Stop the recorder with Ctrl-C, then `burnlint audit run.jsonl`.
 
 ## Rules
 
-| Rule | Flags | Estimated cost |
-|---|---|---|
-| `duplicate-tool-call` | Same tool, identical input and identical result, nothing written and no shell command in between, earlier call didn't fail | Repeated result tokens, carried through the rest of the run |
-| `reread-unchanged` | Same file and range read again, same content returned, with no write to it (under any spelling of the path) and no shell command in between | Same |
-| `cache-thrash` | A turn after the first that writes more to the prompt cache than it reads, above 20k tokens | Rewritten tokens at the write rate minus the read rate |
+| Rule | Flags | Cost | Savable |
+|---|---|---|---|
+| `duplicate-tool-call` | Same tool, identical input and identical result, nothing written and no shell command in between, earlier call didn't fail | Repeated result tokens, carried through the rest of the run | All of it |
+| `reread-unchanged` | Same file and range read again, same content returned, with no write to it (under any spelling of the path) and no shell command in between | Same | All of it |
+| `cache-thrash` | A turn after the first that writes more to the prompt cache than it reads, above 20k tokens. One finding per cause: cache expired, prompt prefix changed, model switched | Rewritten tokens at the write rate minus the read rate | Expired: net of a keep-alive (below). Prefix changed: all of it. Model switched: trade-off |
+
+### Cost, savable and trade-offs
+
+**Cost** is what the pattern cost. **Savable** is what fixing it would have saved, counted only for fixes that take nothing away from the model and net of what the fix itself costs. The header's **avoidable** is the sum of these.
+
+- **No loss**: the model loses only what it already had. A repeated tool result or a second copy of an unchanged file adds nothing. Rewriting an unchanged prompt to the cache costs money without changing what the model sees.
+- **Trade-off**: the fix changes what the model sees or which model runs: compacting, starting fresh, a smaller model. Output quality may change, and a trace can't show whether it would. These findings show their cost with `trade-off` in place of a saving and are left out of "avoidable".
+
+A cache that expired during a break could have been kept warm by re-sending the prompt shortly before the cache lifetime runs out, each time billed as a cache read. Nobody knows in advance how long a break will be, so the saving assumes a fixed policy: keep the cache warm for up to 12 hours, then give up. A break under 12 hours saves the rewrite and pays for its keep-alives. A longer break pays for 12 hours of keep-alives and the rewrite as well, so its saving is negative. Sessions that were never resumed would also have been kept warm, and that cost isn't included. The Claude Code logs checked so far show no keep-alive traffic, so the figure is what one would be worth, not something a setting gives you today.
 
 The repeat rules stay silent when the trace can't show that a call was redundant:
 

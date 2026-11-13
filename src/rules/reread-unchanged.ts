@@ -67,6 +67,9 @@ export const rereadUnchanged: Rule = {
         message: `${g.target} read ${g.turns.length}x with no change in between (turns ${turnList(g.turns)})`,
         costUsd: cost,
         tokens,
+        // The file hadn't changed, so the second copy added nothing.
+        fix: "no-loss",
+        avoidableUsd: cost,
       });
     }
     return findings;

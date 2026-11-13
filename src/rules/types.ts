@@ -7,12 +7,19 @@ export interface RuleConfig {
   mediumUsd: number;
   /** cache-thrash: minimum rewritten tokens for a turn to count. */
   cacheThrashMinTokens: number;
+  /**
+   * cache-thrash: how long the assumed keep-alive keeps an idle cache warm
+   * before giving up. Nobody knows in advance how long a break will be, so
+   * the saving is judged against this fixed policy, not against hindsight.
+   */
+  keepAliveHours: number;
 }
 
 export const defaultConfig: RuleConfig = {
   highUsd: 1,
   mediumUsd: 0.1,
   cacheThrashMinTokens: 20_000,
+  keepAliveHours: 12,
 };
 
 export interface RuleContext {

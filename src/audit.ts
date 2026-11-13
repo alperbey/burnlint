@@ -24,7 +24,10 @@ export interface AuditResult {
   runs: RunSummary[];
   findings: Finding[];
   totalCostUsd: number;
+  /** What the patterns found cost, trade-offs included. */
   findingsCostUsd: number;
+  /** What no-loss fixes would have saved, net of their own cost. Trade-offs are not counted. */
+  avoidableUsd: number;
   prices: { source: string; retrieved: string };
 }
 
@@ -131,6 +134,7 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
     findings,
     totalCostUsd: summaries.reduce((s, r) => s + r.costUsd, 0),
     findingsCostUsd: findings.reduce((s, f) => s + (f.costUsd ?? 0), 0),
+    avoidableUsd: findings.reduce((s, f) => s + (f.avoidableUsd ?? 0), 0),
     prices: { source: prices.source, retrieved: prices.retrieved },
   };
 }
