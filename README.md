@@ -81,8 +81,9 @@ Stop the recorder with Ctrl-C, then `burnlint audit run.jsonl`.
 | Rule | Flags | Cost | Savable |
 |---|---|---|---|
 | `duplicate-tool-call` | Same tool, identical input and identical result, nothing written and no shell command in between, earlier call didn't fail | Repeated result tokens, carried through the rest of the run | All of it |
-| `reread-unchanged` | Same file and range read again, same content returned, with no write to it (under any spelling of the path) and no shell command in between | Same | All of it |
-| `cache-thrash` | A call that reads back at least 1,024 fewer tokens from the prompt cache than the previous call left in it, and writes them again. A large write alone doesn't count: new content has to be written once. One finding per cause: cache expired, prompt prefix changed, model switched | The lost tokens written again, at the write rate minus the read rate (what a stable prefix would have saved) | Expired: net of a keep-alive (below). Prefix changed: all of it. Model switched: trade-off |
+| `reread-unchanged` | File content read again with no write to it (under any spelling of the path) and no shell command in between. When reads return numbered lines (Claude Code `Read`, `N<TAB>text`), any overlap counts: a range inside an earlier one, a whole file after a range, or a partial overlap of 10+ lines; every repeated line must come back unchanged. Other reads must repeat exactly: same path, input and content | The repeated lines' share of the result, carried through the rest of the run | All of it |
+| `cache-thrash` | A call that reads back at least 1,024 fewer tokens from the prompt cache than the previous call left in it, and writes them again. A large write alone doesn't count: new content has to be written once. One finding per cause: cache expired, prompt prefix changed, model switched. When the trace records the prompt, it names what changed (tool definitions, system prompt, an earlier message, or 20+ blocks added in one step, beyond the cache lookback); a rewrite with the prefix unchanged has an unknown cause and isn't counted as savable | The lost tokens written again, at the write rate minus the read rate (what a stable prefix would have saved) | Expired: net of a keep-alive (below). Prefix changed: all of it. Model switched: trade-off |
+| `no-prompt-cache` | A run on Anthropic (API or Vertex) that cached nothing (cache fields reported, all zero) while its calls re-sent a growing prompt above the model's minimum cacheable size. Silent for providers that cache on their own, Bedrock, unknown models and unknown cache fields. When the trace records the prompt, a call counts as a cache hit only if its prefix is the previous call's (same tools, system prompt and earlier messages); otherwise the saving is labeled "up to", an upper bound | Repeated prefix tokens sent at the full rate, at the input rate minus the cache read rate | Net of cache writes, against a 5-minute cache breakpoint at the end of each prompt; a shrinking prompt, a context reset or an idle gap near the 5-minute lifetime counts as a miss |
 
 ### Cost, savable and trade-offs
 
@@ -97,7 +98,8 @@ The repeat rules stay silent when the trace can't show that a call was redundant
 
 - A new human message resets them, since the person may have changed things outside the agent.
 - Shell commands are never reported as duplicates. Their output depends on state the trace doesn't show, and anything read before one may have changed.
-- A call that returned something different from last time learned something, so it is not a repeat. `duplicate-tool-call` needs the results in the trace for this; without them it reports nothing.
+- A call that returned something different from last time learned something, so it is not a repeat. `duplicate-tool-call` and `reread-unchanged` need the results in the trace for this; without them they report nothing.
+- A call that made only rereads isn't counted as savable: it may have returned new lines too, and putting code back at the end of the context can help. `reread-unchanged` shows what such a call cost in its details (`-v`).
 - Tools that poll by name (`get_job_status`, `wait_for_…`, `ping`) and reads of URLs are not treated as repeats.
 
 Findings name the tool and the turns, or the file path. They never include tool inputs such as queries or commands.

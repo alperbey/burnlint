@@ -1,7 +1,17 @@
 import type { Finding, FixEffect, Run, Tokens, Turn } from "../model.js";
 import { cacheWriteTotal } from "../model.js";
 import type { Price } from "../pricing.js";
-import { compactTokens, formatDuration, severityFor, sumNullable, type Rule, type RuleContext } from "./types.js";
+import {
+  compactTokens,
+  formatDuration,
+  PREFIX_CHANGE_LABEL,
+  prefixChange,
+  severityFor,
+  sumNullable,
+  type PrefixChange,
+  type Rule,
+  type RuleContext,
+} from "./types.js";
 
 /**
  * Calls that read back less from the prompt cache than the previous call left
@@ -33,7 +43,10 @@ import { compactTokens, formatDuration, severityFor, sumNullable, type Rule, typ
  *   the pings and the rewrite. Sessions never resumed would also be pinged;
  *   that cost has no turn to attach to and is not included.
  * - prefix changed: no-loss, assuming the changing part can move after the
- *   cached prefix. The whole rewrite counts.
+ *   cached prefix. The whole rewrite counts. When the trace records the
+ *   prompt, the hashes name what changed (tools, system prompt, an earlier
+ *   message, or 20+ blocks added beyond the lookback); if they show nothing
+ *   changed, the cause is unknown and the rewrite isn't counted as savable.
  * - model switched: trade-off. Avoiding it means running the other model.
  */
 export const cacheThrash: Rule = {
@@ -75,7 +88,8 @@ export const cacheThrash: Rule = {
       const cost = price ? (rewriteCost(t, price) * rewritten) / written : null;
       const keepAlive =
         cause === "expired" && price ? keepAliveCost(gapMin!, ttlMin, prefixTokens(pc.tokens) || before.cached, price, ctx) : null;
-      groups[cause].push({ turn: i, written: rewritten, cost, gapMin, keepAlive });
+      const part = cause === "prefix" ? prefixChange(pc.promptKeys, turn.call.promptKeys) : undefined;
+      groups[cause].push({ turn: i, written: rewritten, cost, gapMin, keepAlive, part });
     }
 
     const findings: Finding[] = [];
@@ -96,6 +110,8 @@ interface CacheEvent {
   gapMin?: number;
   /** Expired only: what the keep-alive would have spent; `covered` = the break was short enough for it. */
   keepAlive: { spent: number; covered: boolean } | null;
+  /** Prefix cause only: what the prompt hashes show changed; undefined when the prompt isn't recorded. */
+  part?: PrefixChange;
 }
 
 const FIX: Record<Cause, FixEffect> = { expired: "no-loss", prefix: "no-loss", "model-switch": "trade-off" };
@@ -124,8 +140,17 @@ function findingFor(run: Run, ctx: RuleContext, rule: string, cause: Cause, even
       message = `${rewrites} after ${formatDuration(gaps[0]!)}–${formatDuration(gaps[n - 1]!)} idle, ${share} within the ${hours}h keep-alive`;
     }
   } else if (cause === "prefix") {
-    avoidable = cost;
-    message = `${rewrites} after the prompt prefix changed`;
+    // A rewrite the hashes say had an unchanged prefix has no known fix.
+    const known = events.filter((e) => e.part !== "same");
+    avoidable = known.length ? sumNullable(known.map((e) => e.cost)) : 0;
+    const parts = new Set(events.map((e) => e.part));
+    const only = parts.size === 1 ? [...parts][0] : undefined;
+    message =
+      only === "same"
+        ? `${rewrites} with the prompt prefix unchanged in the trace (cause unknown)`
+        : only
+          ? `${rewrites}: ${PREFIX_CHANGE_LABEL[only]}`
+          : `${rewrites} after the prompt prefix changed`;
   } else {
     message = `${rewrites} after a model switch`;
   }
@@ -140,6 +165,7 @@ function findingFor(run: Run, ctx: RuleContext, rule: string, cause: Cause, even
     details: events.map((e) => {
       const parts = [`turn ${e.turn + 1}`, `${compactTokens(e.written)} tokens`];
       if (e.cost != null) parts.push(`$${e.cost.toFixed(2)}`);
+      if (e.part) parts.push(e.part === "same" ? "prefix unchanged, cause unknown, not counted" : PREFIX_CHANGE_LABEL[e.part]);
       if (cause === "expired" && e.gapMin != null)
         parts.push(`idle ${formatDuration(e.gapMin)}${e.keepAlive && !e.keepAlive.covered ? `, beyond keep-alive` : ""}`);
       return parts.join(" · ");

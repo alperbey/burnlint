@@ -84,6 +84,29 @@ export function contentKey(content: unknown): string {
   return createHash("sha1").update(text).digest("hex").slice(0, 16);
 }
 
+/**
+ * Hashes of a file read's lines by line number, when the result lists
+ * numbered lines as `N<TAB>text` (Claude Code Read, checked on v2.1.x logs;
+ * the AI SDK bench's read_file). Lines after the numbered block, such as a
+ * "continue with start_line" note, are ignored. undefined for any other shape.
+ */
+export function lineKeys(text: string): Map<number, string> | undefined {
+  const keys = new Map<number, string>();
+  let next: number | undefined;
+  for (const line of text.split("\n")) {
+    const m = /^\s*(\d+)\t/.exec(line);
+    if (!m) {
+      if (keys.size) break;
+      return undefined;
+    }
+    const n = Number(m[1]);
+    if (next !== undefined && n !== next) return undefined;
+    keys.set(n, contentKey(line.slice(m[0].length)));
+    next = n + 1;
+  }
+  return keys.size ? keys : undefined;
+}
+
 function pathOf(input: unknown): string | undefined {
   if (!input || typeof input !== "object") return undefined;
   const rec = input as Record<string, unknown>;

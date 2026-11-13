@@ -29,10 +29,10 @@
 
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import type { ModelCall, Run, ToolCall, Turn } from "../model.js";
+import type { ModelCall, PromptKeys, Run, ToolCall, Turn } from "../model.js";
 import { emptyTokens } from "../model.js";
 import { resolveProvider } from "../pricing.js";
-import { classifyTool, contentKey, estimateTokens, stableKey } from "../tools.js";
+import { classifyTool, contentKey, estimateTokens, lineKeys, stableKey } from "../tools.js";
 
 type AnyValue = {
   stringValue?: string;
@@ -253,6 +253,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
       reportedProvider: prov.source === "relabeled" ? prov.reported : undefined,
       tokens,
       failed: (s.error && !tokens) || undefined,
+      promptKeys: promptKeysOf(a),
     };
     return { index, call, tools: [] };
   });
@@ -353,7 +354,52 @@ function toolFromSpan(s: Span): ToolCall {
     resultTokens:
       result === undefined ? undefined : estimateTokens(typeof result === "string" ? result : JSON.stringify(result)),
     resultKey: result === undefined ? undefined : contentKey(result),
+    lineKeys: kind === "read" && typeof result === "string" ? lineKeys(decodedText(result)) : undefined,
   };
+}
+
+/**
+ * Hashes of the prompt a call sent, from the semconv content attributes
+ * (Vercel AI SDK 7 records them by default). undefined when the messages aren't
+ * recorded or any attribute doesn't parse: a value cut off by an attribute
+ * length limit must read as "not checked", never as "changed".
+ */
+function promptKeysOf(a: Record<string, unknown>): PromptKeys | undefined {
+  const raw = str(a["gen_ai.input.messages"]);
+  if (!raw) return undefined;
+  const parse = (v: unknown): unknown => {
+    if (v === undefined) return null; // not sent: no tools, or no system prompt
+    if (typeof v !== "string") return undefined;
+    try {
+      return JSON.parse(v);
+    } catch {
+      return undefined;
+    }
+  };
+  const messages = parse(raw);
+  const tools = parse(a["gen_ai.tool.definitions"]);
+  const system = parse(a["gen_ai.system_instructions"]);
+  if (!Array.isArray(messages) || tools === undefined || system === undefined) return undefined;
+  return {
+    tools: contentKey(stableKey(tools)),
+    system: contentKey(stableKey(system)),
+    messages: messages.map((m) => contentKey(stableKey(m))),
+    blocks: messages.map((m) => {
+      const parts = (m as { parts?: unknown })?.parts;
+      return Array.isArray(parts) ? parts.length : 1;
+    }),
+  };
+}
+
+/** The AI SDK records a string result JSON-encoded ("\"1\\tfoo\""); plain text otherwise. */
+function decodedText(result: string): string {
+  if (!result.startsWith('"')) return result;
+  try {
+    const v: unknown = JSON.parse(result);
+    return typeof v === "string" ? v : result;
+  } catch {
+    return result;
+  }
 }
 
 /**

@@ -33,6 +33,22 @@ export interface ModelCall {
   tokens: Tokens | null;
   /** The call returned an error. It carries no usage; whether it was billed is unknown. */
   failed?: boolean;
+  /**
+   * Hashes of what the call sent, when the trace records the prompt; never the
+   * content. undefined when it isn't recorded or can't be parsed (truncated).
+   */
+  promptKeys?: PromptKeys;
+}
+
+/**
+ * The prompt as Anthropic renders it, tools first, then system, then messages:
+ * one hash per part, plus the number of content blocks in each message.
+ */
+export interface PromptKeys {
+  tools: string;
+  system: string;
+  messages: string[];
+  blocks: number[];
 }
 
 /**
@@ -57,6 +73,11 @@ export interface ToolCall {
   resultTokens?: number;
   /** Hash of the tool result, for equality checks. undefined if the result is unknown. */
   resultKey?: string;
+  /**
+   * File reads only: hash of each returned line, by line number, when the
+   * result lists numbered lines. Lets overlapping ranges be compared.
+   */
+  lineKeys?: Map<number, string>;
 }
 
 export interface Turn {

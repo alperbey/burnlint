@@ -5,9 +5,10 @@ import { emptyTokens } from "../src/model.js";
 import { modelCandidates, PriceTable } from "../src/pricing.js";
 import { cacheThrash } from "../src/rules/cache-thrash.js";
 import { duplicateToolCall } from "../src/rules/duplicate-tool-call.js";
+import { noPromptCache } from "../src/rules/no-prompt-cache.js";
 import { rereadUnchanged } from "../src/rules/reread-unchanged.js";
 import { defaultConfig, formatDuration } from "../src/rules/types.js";
-import { classifyTool, contentKey, isVolatileTool, mayBeSameFile, stableKey } from "../src/tools.js";
+import { classifyTool, contentKey, isVolatileTool, lineKeys, mayBeSameFile, stableKey } from "../src/tools.js";
 
 const ctx = { prices: new PriceTable(), config: defaultConfig };
 
@@ -138,9 +139,9 @@ test("reread-unchanged: a write under another spelling of the path resets", () =
 test("reread-unchanged: different content on the second read is not a reread", () => {
   const run = runOf([[tool("Read", { file_path: "a.ts" }, { result: "v1" })], [], [tool("Read", { file_path: "a.ts" }, { result: "v2" })]]);
   assert.equal(rereadUnchanged.check(run, ctx).length, 0);
-  // Without result content the rule still works from the tool calls alone.
+  // Without result content nothing shows the file didn't change in between: silent, as duplicate-tool-call.
   const blind = runOf([[tool("Read", { file_path: "a.ts" }, { resultKey: undefined })], [tool("Read", { file_path: "a.ts" }, { resultKey: undefined })]]);
-  assert.equal(rereadUnchanged.check(blind, ctx).length, 1);
+  assert.equal(rereadUnchanged.check(blind, ctx).length, 0);
 });
 
 test("reread-unchanged: remote resources are not files", () => {
@@ -339,4 +340,154 @@ test("model name variants resolve to priced entries", () => {
 
 test("idle times read as minutes, hours or days", () => {
   assert.deepEqual([16, 150, 180, 2383, 9840, 128290].map(formatDuration), ["16m", "2h30m", "3h", "39h43m", "6d20h", "89d"]);
+});
+
+/** Calls with caching off: prompt sizes, one minute apart unless `gaps` says otherwise. */
+function uncachedRun(prompts: number[], opts: { model?: string; provider?: string; gapsMin?: number[] } = {}): Run {
+  let at = Date.parse("2026-11-13T10:00:00Z");
+  const turns: Turn[] = prompts.map((input, index) => {
+    if (index) at += (opts.gapsMin?.[index - 1] ?? 1) * 60000;
+    return {
+      index,
+      call: {
+        id: `c${index}`,
+        ts: new Date(at).toISOString(),
+        model: opts.model ?? "claude-sonnet-5-5",
+        provider: opts.provider ?? "anthropic",
+        providerSource: "reported",
+        tokens: { ...emptyTokens(), input, output: 500, cacheRead: 0, cacheWrite5m: 0, cacheKnown: true },
+      },
+      tools: [],
+    };
+  });
+  return { id: "r", source: "test", file: "f", turns, notes: [] };
+}
+
+test("no-prompt-cache: a growing uncached prompt is priced against a 5-minute cache", () => {
+  const f = noPromptCache.check(uncachedRun([10000, 12000, 15000]), ctx);
+  assert.equal(f.length, 1);
+  // Sonnet 5.5: input $2, cache read $0.10, 5m write $2.50 per M.
+  // Reads: 10k at turn 2, 12k at turn 3, each saving $1.90/M.
+  // Writes: 10k + 2k + 3k, each costing $0.50/M more than plain input.
+  const gross = ((10000 + 12000) * 1.9) / 1e6;
+  const premium = ((10000 + 2000 + 3000) * 0.5) / 1e6;
+  assert.ok(Math.abs(f[0]!.costUsd! - gross) < 1e-12);
+  assert.ok(Math.abs(f[0]!.avoidableUsd! - (gross - premium)) < 1e-12);
+  assert.equal(f[0]!.tokens, 22000);
+  assert.deepEqual(f[0]!.turns, [1, 2]);
+  assert.equal(f[0]!.fix, "no-loss");
+});
+
+test("no-prompt-cache: silent when caching is on, unknown, automatic or not checked", () => {
+  const cached = uncachedRun([10000, 12000]);
+  cached.turns[1]!.call.tokens!.cacheRead = 9000;
+  assert.equal(noPromptCache.check(cached, ctx).length, 0);
+  const unknown = uncachedRun([10000, 12000]);
+  unknown.turns[0]!.call.tokens!.cacheKnown = false;
+  assert.equal(noPromptCache.check(unknown, ctx).length, 0);
+  assert.equal(noPromptCache.check(uncachedRun([10000, 12000], { model: "gpt-5", provider: "openai" }), ctx).length, 0);
+  // Bedrock's minimums are documented by AWS, not in our table.
+  assert.equal(noPromptCache.check(uncachedRun([10000, 12000], { provider: "aws.bedrock" }), ctx).length, 0);
+  // A model without a known minimum.
+  assert.equal(noPromptCache.check(uncachedRun([10000, 12000], { model: "claude-3-haiku" }), ctx).length, 0);
+});
+
+test("no-prompt-cache: silent below the minimum, for one call, and when nothing would be read", () => {
+  // Opus 4.5 caches only from 4,096 tokens.
+  assert.equal(noPromptCache.check(uncachedRun([3000, 3500, 4000], { model: "claude-opus-4-5" }), ctx).length, 0);
+  assert.equal(noPromptCache.check(uncachedRun([20000]), ctx).length, 0);
+  // Calls 10 minutes apart: every write would expire unread.
+  assert.equal(noPromptCache.check(uncachedRun([10000, 12000, 15000], { gapsMin: [10, 10] }), ctx).length, 0);
+});
+
+test("no-prompt-cache: a shrinking prompt, a context reset or a near-TTL gap counts as a miss", () => {
+  const shrink = noPromptCache.check(uncachedRun([10000, 12000, 8000, 9000]), ctx)[0]!;
+  // Reads only 10k (turn 2) and 8k (turn 4); turn 3 shrank, so its prefix may have changed.
+  assert.equal(shrink.tokens, 18000);
+  const reset = uncachedRun([10000, 12000, 15000]);
+  reset.turns[2]!.contextReplacedBefore = true;
+  assert.equal(noPromptCache.check(reset, ctx)[0]!.tokens, 10000);
+  // 4.6 minutes is within 10% of the 5-minute TTL: measured gaps aren't start-to-start, so it's a miss.
+  assert.equal(noPromptCache.check(uncachedRun([10000, 12000, 15000], { gapsMin: [1, 4.6] }), ctx)[0]!.tokens, 10000);
+});
+
+/** A read whose result lists lines from..to as `N<TAB>text`; `edit` changes the text of one line. */
+function rangeRead(path: string, from: number, to: number, opts: { edit?: number; note?: string } = {}): ToolCall {
+  const lines = [];
+  for (let n = from; n <= to; n++) lines.push(`${n}\tline ${n}${n === opts.edit ? " changed" : ""}`);
+  const result = lines.join("\n") + (opts.note ? `\n${opts.note}` : "");
+  return tool("read_file", { path, start_line: from, end_line: to }, { result, resultTokens: (to - from + 1) * 10, lineKeys: lineKeys(result) });
+}
+
+test("lineKeys: numbered lines by number; trailing notes ignored; other shapes undefined", () => {
+  const k = lineKeys("7\ta\n8\tb\n(40 lines; continue with start_line=9)")!;
+  assert.deepEqual([...k.keys()], [7, 8]);
+  assert.equal(lineKeys("     12\tx")?.size, 1);
+  assert.equal(lineKeys("no numbers here"), undefined);
+  assert.equal(lineKeys("1\ta\n3\tb"), undefined); // a gap: not one contiguous read
+  assert.equal(lineKeys("header\n1\ta"), undefined);
+});
+
+test("reread-unchanged: a range inside an earlier read counts only its lines", () => {
+  const run = runOf([[rangeRead("src/a.ts", 55, 100)], [], [rangeRead("src/a.ts", 60, 98)]]);
+  const f = rereadUnchanged.check(run, ctx);
+  assert.equal(f.length, 1);
+  assert.equal(f[0]!.tokens, 390);
+  assert.deepEqual(f[0]!.turns, [0, 2]);
+  assert.match(f[0]!.message, /39 lines read again/);
+  assert.equal(f[0]!.details![0], "turn 3: lines 60–98 again, 39 of 39 lines returned; the call made only rereads (1)");
+});
+
+test("reread-unchanged: a whole file after a range counts the overlap, from every earlier read", () => {
+  const run = runOf([[rangeRead("src/a.ts", 1, 40)], [rangeRead("src/a.ts", 100, 120)], [rangeRead("src/a.ts", 1, 200)]]);
+  const f = rereadUnchanged.check(run, ctx)[0]!;
+  // 40 + 21 of 200 lines; the result was 2,000 tokens.
+  assert.equal(f.tokens, Math.round((2000 * 61) / 200));
+  assert.deepEqual(f.turns, [0, 1, 2]);
+  assert.equal(f.details![0], "turn 3: lines 1–40, lines 100–120 again, 61 of 200 lines returned; the call made only rereads (1)");
+});
+
+test("reread-unchanged: a short boundary overlap is not a reread", () => {
+  const run = runOf([[rangeRead("src/a.ts", 112, 165)], [rangeRead("src/a.ts", 165, 246)]]);
+  assert.equal(rereadUnchanged.check(run, ctx).length, 0);
+});
+
+test("reread-unchanged: a changed line, a write or a shell command means the file may have changed", () => {
+  const edited = runOf([[rangeRead("src/a.ts", 1, 50)], [rangeRead("src/a.ts", 1, 50, { edit: 30 })], [rangeRead("src/a.ts", 10, 20, { edit: 30 })]]);
+  // Turn 2 differs, so only turn 3 (inside turn 2's read, unchanged since) repeats.
+  const f = rereadUnchanged.check(edited, ctx);
+  assert.equal(f.length, 1);
+  assert.deepEqual(f[0]!.turns, [1, 2]);
+  const written = runOf([[rangeRead("src/a.ts", 1, 50)], [tool("Edit", { file_path: "src/a.ts" })], [rangeRead("src/a.ts", 1, 50)]]);
+  assert.equal(rereadUnchanged.check(written, ctx).length, 0);
+  const shell = runOf([[rangeRead("src/a.ts", 1, 50)], [tool("Bash", { command: "git stash" })], [rangeRead("src/a.ts", 1, 50)]]);
+  assert.equal(rereadUnchanged.check(shell, ctx).length, 0);
+});
+
+test("reread-unchanged: a call that also did something else isn't called a reread-only call; one that did is priced in details only", () => {
+  const mixed = runOf([[rangeRead("src/a.ts", 1, 50)], [rangeRead("src/a.ts", 1, 50), tool("Grep", { pattern: "x" })]]);
+  assert.equal(rereadUnchanged.check(mixed, ctx)[0]!.details![0], "turn 2: lines 1–50 again, 50 of 50 lines returned");
+  const only = runOf([[rangeRead("src/a.ts", 1, 50)], [rangeRead("src/a.ts", 1, 50)], []]);
+  only.turns[1]!.call.tokens = { ...emptyTokens(), input: 1000, output: 100, cacheRead: 0, cacheWrite5m: 0, cacheKnown: true };
+  const f = rereadUnchanged.check(only, ctx)[0]!;
+  // Sonnet 4.6: 1,000 input at $3/M + 100 output at $15/M.
+  assert.match(f.details![0]!, /; the call made only rereads \(1\) and cost \$0\.0045, not counted$/);
+  // The money is still the repeated lines only.
+  assert.equal(f.costUsd, f.avoidableUsd);
+  assert.ok(Math.abs(f.costUsd! - (500 * 3.75 + 500 * 0.3) / 1e6) < 1e-12);
+});
+
+test("carried cost stops at a context reset: the repeat is gone from context after it", () => {
+  const run = runOf([[tool("search", { q: "x" })], [tool("search", { q: "x" })], [], [], []]);
+  const full = duplicateToolCall.check(run, ctx)[0]!.costUsd!;
+  run.turns[3]!.contextReplacedBefore = true;
+  const cut = duplicateToolCall.check(run, ctx)[0]!.costUsd!;
+  // Written at turn 2, carried through turn 3 only (turns 4 and 5 come after the reset).
+  assert.ok(Math.abs(full - (2000 * 3.75 + 2000 * 0.3 * 3) / 1e6) < 1e-12);
+  assert.ok(Math.abs(cut - (2000 * 3.75 + 2000 * 0.3 * 1) / 1e6) < 1e-12);
+});
+
+test("no-prompt-cache: a prompt that shrank below the minimum doesn't keep the old cache alive", () => {
+  // Turn 3 would otherwise read turn 1's 10k across the shrink; only turn 4 reads (turn 3's 12k).
+  assert.equal(noPromptCache.check(uncachedRun([10000, 300, 12000, 13000]), ctx)[0]!.tokens, 12000);
 });

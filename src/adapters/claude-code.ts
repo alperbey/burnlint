@@ -17,7 +17,7 @@ import { basename } from "node:path";
 import type { ModelCall, Run, ToolCall, Tokens, Turn } from "../model.js";
 import { emptyTokens } from "../model.js";
 import { resolveProvider } from "../pricing.js";
-import { classifyTool, contentKey, estimateTokens, resultText, stableKey } from "../tools.js";
+import { classifyTool, contentKey, estimateTokens, lineKeys, resultText, stableKey } from "../tools.js";
 
 interface Line {
   type?: string;
@@ -169,6 +169,7 @@ function buildRun(records: Line[], file: string, id: string, agent?: string): Ru
         tool.isError = block.is_error === true;
         tool.resultTokens = estimateTokens(resultText(block.content));
         tool.resultKey = contentKey(block.content);
+        if (tool.kind === "read") tool.lineKeys = lineKeys(resultText(block.content));
       }
     }
   }

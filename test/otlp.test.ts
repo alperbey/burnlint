@@ -7,8 +7,9 @@ import { audit } from "../src/audit.js";
 import type { Turn } from "../src/model.js";
 import { PriceTable } from "../src/pricing.js";
 import { cacheThrash } from "../src/rules/cache-thrash.js";
+import { noPromptCache } from "../src/rules/no-prompt-cache.js";
 import { rereadUnchanged } from "../src/rules/reread-unchanged.js";
-import { defaultConfig } from "../src/rules/types.js";
+import { defaultConfig, prefixChange } from "../src/rules/types.js";
 import { chatSpan, otlp, span, tmpFile, toolSpan } from "./helpers.js";
 
 const ctx = { prices: new PriceTable(), config: defaultConfig };
@@ -247,3 +248,127 @@ for (const [format, failedId] of [["legacy", "9cdd1c67f10a"], ["semconv", "e4983
     }
   });
 }
+
+test("real AI SDK 7 capture (reread): overlapping rereads found, a range boundary stays silent", () => {
+  const file = join(root, "fixtures", "ai-sdk-v7-reread.jsonl");
+  const RERUN = "87495b49a8cb"; // principle, check phase told to reread every cited file
+  const NORMAL = "2d34c630fae2"; // review, normal: two ranges of src/audit.ts share one line
+  // What the SDK itself reported for each run (result.totalUsage), not read from the trace.
+  const sdk: Record<string, { input: number; read: number; write: number; output: number }> = {
+    [RERUN]: { input: 64603, read: 41651, write: 22934, output: 3620 },
+    [NORMAL]: { input: 133824, read: 98195, write: 35615, output: 2688 },
+  };
+  const r = audit([file]);
+  const price = new PriceTable().lookup("claude-sonnet-5-5")!;
+  for (const s of r.runs) {
+    const t = sdk[s.id.split("#")[1]!]!;
+    const want = ((t.input - t.read - t.write) * price.input! + t.read * price.cacheRead! + t.write * price.cacheWrite5m! + t.output * price.output!) / 1e6;
+    assert.ok(Math.abs(s.costUsd - want) < 1e-9, `${s.id}: ${s.costUsd} vs ${want}`);
+  }
+  assert.deepEqual(r.findings.filter((f) => f.runId.endsWith(NORMAL)), []);
+
+  // Independent of the rule's line comparison: overlap of the requested ranges, per path.
+  // A read without a range covers the lines it returned.
+  const run = readOtlp(file).find((x) => x.id.endsWith(RERUN))!;
+  const seen = new Map<string, Array<[number, number]>>();
+  const want = new Map<string, number>();
+  for (const turn of run.turns)
+    for (const t of turn.tools) {
+      if (t.name !== "read_file") continue;
+      const input = t.input as { path: string; start_line?: number; end_line?: number };
+      const lo = input.start_line ?? 1;
+      const hi = Math.min(input.end_line ?? Infinity, lo + t.lineKeys!.size - 1);
+      const prev = seen.get(input.path) ?? [];
+      const covered = new Set<number>();
+      for (const [a, b] of prev) for (let n = Math.max(a, lo); n <= Math.min(b, hi); n++) covered.add(n);
+      if (covered.size === hi - lo + 1 || covered.size >= 10) want.set(input.path, (want.get(input.path) ?? 0) + covered.size);
+      seen.set(input.path, [...prev, [lo, hi]]);
+    }
+  const got = new Map(
+    r.findings.filter((f) => f.runId === run.id).map((f) => {
+      assert.equal(f.rule, "reread-unchanged");
+      const [, path, lines] = /^(\S+): (\d+) lines? read again/.exec(f.message)!;
+      return [path!, Number(lines)];
+    }),
+  );
+  assert.deepEqual(got, want);
+  assert.equal(got.size, 6);
+});
+
+test("real AI SDK 7 capture (nocache): no-prompt-cache fires, savable worked out by hand from the calls", () => {
+  const file = join(root, "fixtures", "ai-sdk-v7-nocache.jsonl");
+  const r = audit([file]);
+  // The SDK's own totals for the run: 45,107 input, 2,911 output, no cache reads or writes.
+  assert.ok(Math.abs(r.runs[0]!.costUsd - (45107 * 2 + 2911 * 10) / 1e6) < 1e-9);
+  const f = r.findings.filter((x) => x.rule === "no-prompt-cache");
+  assert.equal(f.length, 1);
+  // Prompts per call, seconds apart: 1,073, 2,572, 8,397, 10,002, 11,058, 12,005 (all above Sonnet 5.5's 512).
+  // With a breakpoint at the end of each prompt, calls 2-6 read the previous prompt and every prompt token
+  // is written once. Sonnet 5.5: a read saves $2 - $0.10, a 5m write costs $2.50 - $2 more.
+  const reads = 1073 + 2572 + 8397 + 10002 + 11058;
+  assert.equal(f[0]!.tokens, reads);
+  assert.ok(Math.abs(f[0]!.costUsd! - (reads * 1.9) / 1e6) < 1e-12);
+  assert.ok(Math.abs(f[0]!.avoidableUsd! - (reads * 1.9 - 12005 * 0.5) / 1e6) < 1e-12);
+});
+
+test("prompt hashes: recorded per call, compared tools > system > messages; a cut-off attribute means not checked", () => {
+  const msg = (role: string, text: string, parts = 1) => ({ role, parts: Array.from({ length: parts }, () => ({ type: "text", content: text })) });
+  const attrs = (messages: object[], system: string, extra: Record<string, string> = {}) => ({
+    "gen_ai.request.model": "claude-sonnet-5-5",
+    "gen_ai.provider.name": "anthropic",
+    "gen_ai.usage.input_tokens": 5000,
+    "gen_ai.usage.output_tokens": 100,
+    "gen_ai.system_instructions": JSON.stringify([{ type: "text", content: system }]),
+    "gen_ai.tool.definitions": JSON.stringify([{ type: "function", name: "grep" }]),
+    "gen_ai.input.messages": JSON.stringify(messages),
+    ...extra,
+  });
+  const a = msg("user", "task");
+  const b = msg("assistant", "step");
+  const spans = [
+    chatSpan("c1", 1, attrs([a], "sys")),
+    chatSpan("c2", 2, attrs([a, b, msg("tool", "r")], "sys")), // appended: same
+    chatSpan("c3", 3, attrs([a, b, msg("tool", "r")], "sys at 10:03")), // system changed
+    chatSpan("c4", 4, attrs([a, msg("assistant", "edited")], "sys at 10:03")), // earlier message changed
+    chatSpan("c5", 5, attrs([a, msg("assistant", "edited"), msg("assistant", "x", 12), msg("tool", "y", 12)], "sys at 10:03")), // 24 blocks added
+    chatSpan("c6", 6, attrs([a], "sys", { "gen_ai.input.messages": JSON.stringify([a]).slice(0, 10) })), // cut off
+  ];
+  const run = readOtlp(tmpFile("p.json", JSON.stringify(otlp(spans))))[0]!;
+  const keys = run.turns.map((t) => t.call.promptKeys);
+  const changes = keys.slice(1).map((k, i) => prefixChange(keys[i], k));
+  assert.deepEqual(changes, ["same", "system", "messages", "lookback", undefined]);
+  assert.deepEqual(keys[4]!.blocks, [1, 1, 12, 12]);
+});
+
+test("real AI SDK 7 captures: the prefix check sees the busted system prompt and nothing else", () => {
+  const changes = (name: string) =>
+    readOtlp(join(root, "fixtures", `ai-sdk-v7-${name}.jsonl`)).flatMap((run) =>
+      run.turns.slice(1).map((t, i) => prefixChange(run.turns[i]!.call.promptKeys, t.call.promptKeys)),
+    );
+  // The prefix variant puts the current time in the system prompt on every step, the first included.
+  assert.deepEqual(changes("prefix"), Array(5).fill("system"));
+  for (const name of ["reread", "nocache"]) assert.ok(changes(name).every((c) => c === "same"), name);
+  // Older fixtures were redacted before prompts were kept comparable: not checked.
+  assert.ok(changes("semconv").every((c) => c === undefined));
+
+  const prefix = audit([join(root, "fixtures", "ai-sdk-v7-prefix.jsonl")]).findings;
+  assert.deepEqual(prefix.map((f) => [f.rule, f.message]), [["cache-thrash", "5 cache rewrites: system prompt changed"]]);
+  const nocache = audit([join(root, "fixtures", "ai-sdk-v7-nocache.jsonl")]).findings[0]!;
+  assert.doesNotMatch(nocache.message, /up to/);
+});
+
+test("real AI SDK 7 capture (prefix) with caching stripped: no-prompt-cache stays silent, caching as it stands would save nothing", () => {
+  const run = readOtlp(join(root, "fixtures", "ai-sdk-v7-prefix.jsonl"))[0]!;
+  for (const t of run.turns) {
+    const k = t.call.tokens!;
+    k.input = k.input! + (k.cacheRead ?? 0) + (k.cacheWriteOther ?? 0);
+    k.cacheRead = 0;
+    k.cacheWriteOther = 0;
+  }
+  assert.deepEqual(noPromptCache.check(run, ctx), []);
+  // Without the prompt hashes the same run would be credited with hits: the upper-bound case.
+  for (const t of run.turns) t.call.promptKeys = undefined;
+  const f = noPromptCache.check(run, ctx)[0]!;
+  assert.match(f.message, /^prompt caching off: up to /);
+  assert.match(f.details!.join("\n"), /prefix not checked on 5 of these/);
+});

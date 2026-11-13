@@ -1,4 +1,4 @@
-import type { Finding, FixEffect, Run, Severity } from "../model.js";
+import type { Finding, FixEffect, PromptKeys, Run, Severity } from "../model.js";
 import type { PriceTable } from "../pricing.js";
 
 export interface RuleConfig {
@@ -79,3 +79,29 @@ export function sumNullable(values: Array<number | null | undefined>): number | 
   }
   return any ? total : null;
 }
+
+/**
+ * What kept a prompt cache written at the end of `prev` from being read by
+ * `cur`, from the prompt hashes: "same" when nothing did. Anthropic renders
+ * tools, then system, then messages, so a change in an earlier part loses
+ * everything after it. A breakpoint finds an earlier cache entry at most 20
+ * blocks back, itself included, so a step that adds 20 or more blocks misses
+ * too. undefined when either prompt isn't recorded.
+ */
+export type PrefixChange = "same" | "tools" | "system" | "messages" | "lookback";
+
+export function prefixChange(prev: PromptKeys | undefined, cur: PromptKeys | undefined): PrefixChange | undefined {
+  if (!prev || !cur) return undefined;
+  if (prev.tools !== cur.tools) return "tools";
+  if (prev.system !== cur.system) return "system";
+  if (cur.messages.length < prev.messages.length || prev.messages.some((m, i) => cur.messages[i] !== m)) return "messages";
+  const added = cur.blocks.slice(prev.messages.length).reduce((s, n) => s + n, 0);
+  return added >= 20 ? "lookback" : "same";
+}
+
+export const PREFIX_CHANGE_LABEL: Record<Exclude<PrefixChange, "same">, string> = {
+  tools: "tool definitions changed",
+  system: "system prompt changed",
+  messages: "an earlier message changed",
+  lookback: "20+ blocks added in one step, beyond the cache lookback",
+};

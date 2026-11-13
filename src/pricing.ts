@@ -103,15 +103,71 @@ export function contextRates(model: string | undefined, prices: PriceTable): { f
 
 /**
  * Estimated cost of `tokens` extra tokens entering context at `turnIndex` and
- * being carried through every later turn of the run.
+ * being carried through every later turn, up to the next context reset.
  */
 export function carriedCost(run: Run, turnIndex: number, tokens: number, prices: PriceTable): number | null {
   const turn = run.turns[turnIndex];
   if (!turn) return null;
   const rates = contextRates(turn.call.model, prices);
   if (!rates) return null;
-  const later = Math.max(0, run.turns.length - turnIndex - 1);
+  let later = 0;
+  while (turnIndex + later + 1 < run.turns.length && !run.turns[turnIndex + later + 1]!.contextReplacedBefore) later++;
   return (tokens * rates.first + tokens * rates.carried * later) / 1e6;
+}
+
+// --- prompt caching ---------------------------------------------------------
+
+/**
+ * Providers whose models cache only when the request asks for it
+ * (`cache_control`). Others cache on their own (OpenAI, DeepSeek, Gemini
+ * implicit) or weren't checked. Bedrock is left out: its minimums are
+ * documented by AWS, not in the table below.
+ */
+const EXPLICIT_CACHE_PROVIDERS = new Set(["anthropic", "gcp.vertex_ai"]);
+
+export function cachesOnlyWhenAsked(provider: string): boolean {
+  return EXPLICIT_CACHE_PROVIDERS.has(provider);
+}
+
+/**
+ * Shortest prompt a model will cache, in tokens; shorter prompts are processed
+ * without caching and no error is returned. From Anthropic's prompt caching
+ * page (Claude API, Claude Platform on AWS, Google Cloud, Foundry), checked
+ * 2026-11-13.
+ */
+const MIN_CACHEABLE: Record<string, number> = {
+  "claude-fable-5-2": 512,
+  "claude-mythos-5-2": 512,
+  "claude-fable-5-1": 512,
+  "claude-mythos-5-1": 512,
+  "claude-opus-5-5": 512,
+  "claude-opus-5": 512,
+  "claude-sonnet-5-5": 512,
+  "claude-fable-5": 512,
+  "claude-mythos-5": 512,
+  "claude-haiku-5-5": 512,
+  "claude-mythos-preview": 2048,
+  "claude-opus-4-7": 2048,
+  "claude-opus-4-6": 4096,
+  "claude-opus-4-5": 4096,
+  "claude-opus-4-8": 1024,
+  "claude-sonnet-5": 1024,
+  "claude-sonnet-4-6": 1024,
+  "claude-sonnet-4-5": 1024,
+  "claude-opus-4-1": 1024,
+  "claude-opus-4": 1024,
+  "claude-sonnet-4": 1024,
+  "claude-haiku-4-5": 4096,
+};
+
+/** Minimum cacheable prompt for a model; undefined when not known. */
+export function minCacheableTokens(model: string | undefined): number | undefined {
+  if (!model) return undefined;
+  for (const candidate of modelCandidates(model)) {
+    const n = MIN_CACHEABLE[candidate];
+    if (n !== undefined) return n;
+  }
+  return undefined;
 }
 
 // --- provider inference -----------------------------------------------------
