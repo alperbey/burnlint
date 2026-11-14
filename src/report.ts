@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { basename, extname, relative, sep } from "node:path";
 import type { AuditResult, RunSummary } from "./audit.js";
+import { SIGNIFICANCE, type DiffResult } from "./diff.js";
 import type { Finding } from "./model.js";
 
 const usd = (n: number | null): string =>
@@ -261,4 +262,132 @@ function wrap(text: string, width: number): string[] {
 
 function escapeMd(s: string): string {
   return s.replace(/\|/g, "\\|").replace(/\n/g, " ");
+}
+
+// --- diff ---------------------------------------------------------------------
+
+const signedPct = (x: number | null) => {
+  if (x == null) return "?";
+  const v = x * 100;
+  const s = Math.abs(v) < 10 ? v.toFixed(1) : v.toFixed(0);
+  return `${v >= 0 ? "+" : ""}${s}%`;
+};
+const pValue = (p: number) => (p < 0.001 ? "p<0.001" : `p=${p.toFixed(p < 0.01 ? 3 : 2)}`);
+
+export function renderDiffJson(r: DiffResult): string {
+  return JSON.stringify(r, null, 2);
+}
+
+/** The verdict in one line, without the numbers before it. */
+export function verdictLine(r: DiffResult): string {
+  const o = r.overall;
+  if (!o) return "nothing to compare: no group has priced runs on both sides";
+  const ch = signedPct(o.change);
+  switch (o.verdict) {
+    case "higher":
+      return `higher, ${ch} (${pValue(o.pTwoSided)})`;
+    case "lower":
+      return `lower, ${ch} (${pValue(o.pTwoSided)})`;
+    case "no clear change":
+      return `no clear change: ${ch} is within run-to-run noise (${pValue(o.pTwoSided)})`;
+    case "too few runs":
+      return `too few runs to tell (${ch}): no difference these runs could show would reach p<${SIGNIFICANCE}`;
+    case "can't tell": {
+      const n = r.base.unpriced + r.head.unpriced;
+      return `can't tell: ${plural(n, "run")} with calls that have no price or no usage, so their cost is unknown`;
+    }
+  }
+}
+
+export function renderDiffTable(r: DiffResult, opts: TableOptions = {}): string {
+  const c = (code: string, s: string) => (opts.color && s ? `\x1b[${code}m${s}\x1b[0m` : s);
+  const dim = (s: string) => c("2", s);
+  const out: string[] = [];
+  out.push(`${c("1", "burnlint diff")}  ${dim(r.groupBy ? `grouped by ${r.groupBy}` : "all runs in one group")}`);
+  out.push("");
+  for (const [name, s] of [["base", r.base], ["head", r.head]] as const) {
+    const left = [s.excluded ? `${s.excluded} not counted (no priced call)` : ""].filter(Boolean);
+    out.push(`  ${name}  ${plural(s.counted, "run")}${left.length ? dim(` · ${left.join(", ")}`) : ""}  ${dim(s.paths.map(short).join(", "))}`);
+  }
+  out.push("");
+
+  const o = r.overall;
+  if (o) {
+    const color = o.verdict === "higher" ? "1;31" : o.verdict === "lower" ? "1;32" : "1";
+    const lead = `  cost per run  ${usd(o.baseUsd)} → ${usd(o.headUsd)}   `;
+    hanging(lead, verdictLine(r), opts.width).forEach((l, i) => out.push(i ? l : lead + c(color, l.slice(lead.length))));
+    const sub: string[] = [];
+    if (r.groups.length > 1) sub.push("at base's mix of groups");
+    const mixDiffers =
+      r.onlyBase.length || r.onlyHead.length || r.groups.some((g) => Math.abs(g.head.runs / headShared(r) - g.weight) > 1e-9);
+    if (mixDiffers && r.base.pooledUsd != null && r.head.pooledUsd != null)
+      sub.push(`all runs pooled: ${usd(r.base.pooledUsd)} → ${usd(r.head.pooledUsd)}`);
+    if (o.verdict !== "can't tell" && o.verdict !== "too few runs" && o.noise != null)
+      sub.push(`run-to-run noise here: about ±${(o.noise * 100).toFixed(0)}%`);
+    sub.push(o.method === "exact" ? `exact test over ${int(o.permutations)} relabelings` : `test over ${int(o.permutations)} sampled relabelings`);
+    out.push(...hanging(" ".repeat(16), sub.join(" · "), opts.width).map(dim));
+  } else {
+    out.push(`  ${verdictLine(r)}`);
+  }
+  out.push("");
+
+  if (r.groups.length) {
+    const head = ["group", "side", "runs", "mean", "median", "min", "max", "calls", "prompt tok", "output tok", "cache", ""];
+    const rows: string[][] = [];
+    for (const g of r.groups) {
+      for (const [side, s] of [["base", g.base], ["head", g.head]] as const) {
+        rows.push([
+          side === "base" ? g.name : "",
+          side,
+          String(s.runs),
+          usd(s.meanUsd),
+          usd(s.medianUsd),
+          usd(s.minUsd),
+          usd(s.maxUsd),
+          s.calls.toFixed(1),
+          int(Math.round(s.promptTokens)),
+          int(Math.round(s.outputTokens)),
+          s.cacheShare == null ? "?" : `${(s.cacheShare * 100).toFixed(0)}%`,
+          side === "head" ? signedPct(g.change) : "",
+        ]);
+      }
+    }
+    const w = head.map((h, i) => Math.max(h.length, ...rows.map((row) => row[i]!.length)));
+    const left = (i: number) => i < 2;
+    const line = (cells: string[]) => "  " + cells.map((s, i) => (left(i) ? s.padEnd(w[i]!) : s.padStart(w[i]!))).join("  ").trimEnd();
+    out.push(dim(line(head)));
+    for (const row of rows) out.push(line(row));
+    out.push(dim(`  per run means; cache = cache reads as a share of prompt tokens`));
+    out.push("");
+  }
+
+  const notes = diffNotes(r);
+  if (notes.length) {
+    out.push(dim("Notes"));
+    for (const n of notes) out.push(...hanging("  - ", n, opts.width).map(dim));
+    out.push("");
+  }
+  out.push(...hanging("", `Costs are estimates. Prices: ${r.prices.source}, retrieved ${r.prices.retrieved}.`, opts.width).map(dim));
+  return out.join("\n");
+}
+
+const headShared = (r: DiffResult) => r.groups.reduce((s, g) => s + g.head.runs, 0);
+
+function diffNotes(r: DiffResult): string[] {
+  const out: string[] = [];
+  const { base: b, head: h } = r;
+  if (b.failed || h.failed) {
+    const more = h.failed / Math.max(1, h.runs) > b.failed / Math.max(1, b.runs);
+    out.push(
+      `runs with a failed call: base ${b.failed} of ${b.runs}, head ${h.failed} of ${h.runs}` +
+        (more ? `. A failed run usually stops early and costs less, so head may look cheaper than it is` : ""),
+    );
+  }
+  if (b.models.join() !== h.models.join())
+    out.push(`models: base ${b.models.join(", ") || "?"}; head ${h.models.join(", ") || "?"}. A model change is a trade-off: cost alone doesn't show whether the work still gets done`);
+  const unpriced = [...new Set([...b.unpricedModels, ...h.unpricedModels])];
+  if (unpriced.length) out.push(`no price for model(s): ${unpriced.join(", ")} (add them with --prices)`);
+  if (r.onlyBase.length) out.push(`only in base, not compared: ${r.onlyBase.join(", ")}`);
+  if (r.onlyHead.length) out.push(`only in head, not compared: ${r.onlyHead.join(", ")}`);
+  return out;
 }

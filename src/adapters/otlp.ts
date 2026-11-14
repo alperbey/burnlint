@@ -297,9 +297,40 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
     dialect: list.some((s) => str(s.attrs["ai.operationId"])?.startsWith("ai.")) ? "ai-sdk" : "gen_ai",
     file,
     agent: service,
+    labels: labelsOf(list),
     turns,
     notes,
   };
+}
+
+/** Attributes that may hold prompts, outputs or tool data; never kept as labels. */
+const CONTENT_KEY = /messages|prompt|instructions|definitions|arguments|result|response|content|input|output|text/i;
+const MAX_LABEL_LENGTH = 200;
+
+/**
+ * Labels of a run: short scalar attributes of its root spans (where callers put
+ * what the run was: a task, a branch, an input id), the agent name and the
+ * service name.
+ */
+function labelsOf(list: Span[]): Record<string, string> {
+  const ids = new Set(list.map((s) => s.spanId));
+  const labels: Record<string, string> = {};
+  const keep = (key: string, value: unknown) => {
+    if (key in labels || CONTENT_KEY.test(key)) return;
+    if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") return;
+    const v = String(value);
+    if (v && v.length <= MAX_LABEL_LENGTH) labels[key] = v;
+  };
+  for (const s of list) {
+    if (s.parentSpanId && ids.has(s.parentSpanId)) continue;
+    for (const [key, value] of Object.entries(s.attrs)) keep(key, value);
+  }
+  // The AI SDK's ai.* spans name the agent by functionId; its semconv spans put the same value in gen_ai.agent.name.
+  for (const s of list) keep("gen_ai.agent.name", s.attrs["gen_ai.agent.name"]);
+  for (const s of list) keep("gen_ai.agent.name", s.attrs["ai.telemetry.functionId"]);
+  const service = list.find((s) => s.service)?.service;
+  if (service) keep("service.name", service);
+  return labels;
 }
 
 /** Whole prompt of a call: uncached input plus cache reads and writes. null when unknown. */

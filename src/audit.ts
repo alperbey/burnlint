@@ -2,7 +2,7 @@ import { closeSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import { looksLikeClaudeCode, readClaudeCode } from "./adapters/claude-code.js";
 import { looksLikeOtlp, readOtlp } from "./adapters/otlp.js";
-import type { Finding, Run, Severity } from "./model.js";
+import { cacheWriteTotal, type Finding, type Run, type Severity } from "./model.js";
 import { callCost, PriceTable } from "./pricing.js";
 import { defaultConfig, rules, type RuleConfig } from "./rules/index.js";
 
@@ -19,6 +19,16 @@ export interface RunSummary {
   failedCalls: number;
   costUsd: number;
   unpricedModels: string[];
+  /** Models of the calls, sorted. */
+  models: string[];
+  /** Tokens over calls with usage: whole prompts (uncached, cache reads and writes), output, cache reads. */
+  promptTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  /** Calls with usage but no cache information: the run's cache share is unknown. */
+  cacheUnknownCalls: number;
+  /** What the run was, for grouping (see Run.labels); `project` for Claude Code. */
+  labels: Record<string, string>;
   notes: string[];
 }
 
@@ -74,6 +84,8 @@ export interface AuditOptions {
   config?: Partial<RuleConfig>;
   /** Only run these rule ids. */
   only?: string[];
+  /** false: price runs without running any rule. */
+  rules?: boolean;
   /** Expected volume, to project spend and avoidable spend to a month. */
   runsPerMonth?: number;
 }
@@ -116,7 +128,7 @@ export function loadRuns(file: string): Run[] | null {
 export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
   const prices = opts.prices ?? new PriceTable();
   const config = { ...defaultConfig, ...opts.config };
-  const active = opts.only?.length ? rules.filter((r) => opts.only!.includes(r.id)) : rules;
+  const active = opts.rules === false ? [] : opts.only?.length ? rules.filter((r) => opts.only!.includes(r.id)) : rules;
 
   const files = collectFiles(paths);
   const named = new Set(paths.filter((p) => statSync(p).isFile()));
@@ -143,7 +155,17 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
       let priced = 0;
       let failed = 0;
       const unpriced = new Set<string>();
+      const models = new Set<string>();
+      const tok = { prompt: 0, output: 0, cacheRead: 0, cacheUnknown: 0 };
       for (const t of run.turns) {
+        if (t.call.model) models.add(t.call.model);
+        const k = t.call.tokens;
+        if (k) {
+          tok.prompt += (k.input ?? 0) + (k.cacheRead ?? 0) + cacheWriteTotal(k);
+          tok.output += k.output ?? 0;
+          tok.cacheRead += k.cacheRead ?? 0;
+          if (!k.cacheKnown) tok.cacheUnknown++;
+        }
         const c = callCost(t.call, prices);
         if (c != null) {
           cost += c;
@@ -166,6 +188,12 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
         failedCalls: failed,
         costUsd: cost,
         unpricedModels: [...unpriced],
+        models: [...models].sort(),
+        promptTokens: tok.prompt,
+        outputTokens: tok.output,
+        cacheReadTokens: tok.cacheRead,
+        cacheUnknownCalls: tok.cacheUnknown,
+        labels: { ...run.labels, ...(run.project ? { project: run.project } : {}) },
         notes: run.notes,
       });
       for (const rule of active) findings.push(...rule.check(run, { prices, config }));

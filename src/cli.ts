@@ -3,16 +3,18 @@ import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { audit, severityRank } from "./audit.js";
+import { diff, gate, GroupKeyError, type DiffResult } from "./diff.js";
 import type { Severity } from "./model.js";
 import { PriceTable, type Price } from "./pricing.js";
 import { DEFAULT_PORT, PROTOBUF_HINT, defaultRecordFile, startRecorder } from "./record.js";
-import { renderJson, renderMarkdown, renderTable } from "./report.js";
+import { renderDiffJson, renderDiffTable, renderJson, renderMarkdown, renderTable, verdictLine } from "./report.js";
 import { defaultConfig, rules } from "./rules/index.js";
 
 const HELP = `burnlint — find wasted tokens and money in agent traces
 
 Usage:
   burnlint audit [paths...]   Lint trace files or folders
+  burnlint diff <base> <head> Compare cost per run before and after a change
   burnlint record             Receive OTLP traces from a running agent and save them for audit
   burnlint rules              List rules
 
@@ -31,6 +33,20 @@ Options:
   -v, --verbose                  Show each occurrence, file paths and all notes
   -h, --help
 
+Diff:
+  Runs the same tasks before (base) and after (head) a change; each side is a trace file or a
+  folder. Runs are compared within groups (the same agent or task), and the overall change is
+  at base's mix of groups, with a permutation test of whether it is more than noise.
+
+      --group-by <key>           Run label to group by (default: gen_ai.agent.name, else the
+                                 Claude Code project, else one group), e.g. a root-span attribute
+      --fail-above <pct>         Exit 1 if cost per run rose more than this many percent and the
+                                 runs show the rise clearly (one-sided p < 0.05). A rise the runs
+                                 can't tell from noise passes. With 3 runs per group, only rises
+                                 of 15-20% or more are reliably seen; use 5+ runs for 10%.
+  -f, --format <table|json>      Output format (default: table)
+      --prices <file.json>       Price overrides, as for audit
+
 Record:
   Listens on 127.0.0.1 for OTLP/HTTP with JSON encoding and appends each trace export to a
   JSONL file. Start it, run the agent with OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
@@ -46,6 +62,7 @@ const err = (line: string) => process.stderr.write(line + "\n");
 /** Options each command takes. Anything else on the command line is refused, not ignored. */
 const COMMAND_OPTIONS: Record<string, string[]> = {
   audit: ["format", "fail-on", "rule", "prices", "high-usd", "medium-usd", "runs-per-month", "verbose"],
+  diff: ["format", "group-by", "fail-above", "prices"],
   record: ["out", "port", "verbose"],
   rules: [],
 };
@@ -121,6 +138,76 @@ async function record(values: { out?: string; port?: string; verbose: boolean })
   return 0;
 }
 
+function runDiff(paths: string[], values: { format: string; "group-by"?: string; "fail-above"?: string; prices?: string }): number {
+  if (paths.length !== 2) {
+    err(`diff takes two paths, base and head (got ${paths.length})`);
+    return 2;
+  }
+  for (const t of paths) {
+    if (!existsSync(t)) {
+      err(`not found: ${t}`);
+      return 2;
+    }
+  }
+  if (!["table", "json"].includes(values.format)) {
+    err(`--format must be table or json for diff, got "${values.format}"`);
+    return 2;
+  }
+  const raw = values["fail-above"];
+  const failAbove = raw === undefined ? undefined : Number(raw.replace(/%$/, ""));
+  if (failAbove !== undefined && (raw!.trim() === "" || !Number.isFinite(failAbove) || failAbove < 0)) {
+    err(`--fail-above must be a percentage of zero or more, got "${raw}"`);
+    return 2;
+  }
+  const groupBy = values["group-by"];
+  if (groupBy !== undefined && !groupBy.trim()) {
+    err(`--group-by needs a label key`);
+    return 2;
+  }
+
+  const prices = new PriceTable(values.prices ? loadPrices(values.prices) : undefined);
+  let result: DiffResult;
+  try {
+    result = diff([paths[0]!], [paths[1]!], { prices, groupBy });
+  } catch (e) {
+    if (e instanceof GroupKeyError) {
+      err(`--group-by ${groupBy}: ${e.message}`);
+      return 2;
+    }
+    throw e;
+  }
+
+  if (values.format === "json") process.stdout.write(renderDiffJson(result) + "\n");
+  else
+    process.stdout.write(
+      renderDiffTable(result, {
+        color: process.stdout.isTTY && !process.env.NO_COLOR,
+        width: process.stdout.isTTY ? process.stdout.columns : undefined,
+      }) + "\n",
+    );
+
+  for (const [name, side] of [["base", result.base], ["head", result.head]] as const) {
+    if (!side.counted) {
+      err(`burnlint: no priced runs in ${name} (${side.paths.join(", ")}); nothing to compare`);
+      return 2;
+    }
+  }
+  if (failAbove === undefined) return 0;
+  const g = gate(result, failAbove);
+  const ch = result.overall?.change;
+  const rose = ch == null ? "" : `${(ch * 100).toFixed(1)}%`;
+  if (g === "can't tell") {
+    err(`burnlint: --fail-above ${failAbove}%: can't decide, ${verdictLine(result)}`);
+    return 2;
+  }
+  if (g === "fail") {
+    err(`burnlint: cost per run rose ${rose}, above ${failAbove}% (one-sided p=${result.overall!.pHigher.toPrecision(2)})`);
+    return 1;
+  }
+  if (g === "unclear") err(`burnlint: cost per run rose ${rose}, above ${failAbove}%, but not enough runs to tell it from noise; passing`);
+  return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
   const { values, positionals, tokens } = parseArgs({
     args: argv,
@@ -134,6 +221,8 @@ async function main(argv: string[]): Promise<number> {
       "high-usd": { type: "string" },
       "medium-usd": { type: "string" },
       "runs-per-month": { type: "string" },
+      "group-by": { type: "string" },
+      "fail-above": { type: "string" },
       out: { type: "string", short: "o" },
       port: { type: "string" },
       verbose: { type: "boolean", short: "v", default: false },
@@ -171,6 +260,8 @@ async function main(argv: string[]): Promise<number> {
     }
     return record(values);
   }
+
+  if (command === "diff") return runDiff(paths, values);
 
   const format = values.format;
   if (!["table", "json", "md"].includes(format)) {

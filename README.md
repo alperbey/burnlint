@@ -17,6 +17,7 @@ npx burnlint audit traces.json          # an OTLP/JSON export
 npx burnlint audit ./traces --runs-per-month 20000  # what it comes to at your volume
 npx burnlint audit ./traces --fail-on high -f md   # CI, Markdown for PR comments
 npx burnlint record -o run.jsonl        # capture OTLP traces from a running agent
+npx burnlint diff base.jsonl head.jsonl --fail-above 15  # did this change make runs cost more?
 ```
 
 ## Example
@@ -50,6 +51,39 @@ Notes
   - deepseek-demo-agent 5f017722: 3 call(s) relabeled by model/server: openai -> deepseek
   - deepseek-demo-agent 5f017722: 3 call(s) report no cache usage; their cost is an upper bound (cached tokens priced at full rate)
 ```
+
+## Comparing before and after
+
+`burnlint diff <base> <head>` compares cost per run between two sets of runs of the same tasks: before and after a prompt, tool or model change. Each side is a trace file or a folder.
+
+```
+$ burnlint diff normal.jsonl reread.jsonl --group-by bench.task
+burnlint diff  grouped by bench.task
+
+  base  9 runs  normal.jsonl
+  head  9 runs  reread.jsonl
+
+  cost per run  $0.081 → $0.111   higher, +38% (p<0.001)
+                at base's mix of groups · run-to-run noise here: about ±11% · exact test over 8,000 relabelings
+
+  group      side  runs    mean  median     min     max  calls  prompt tok  output tok  cache
+  review     base     3  $0.133  $0.126  $0.124  $0.149    6.0     166,457       3,137    79%
+             head     3  $0.183  $0.177  $0.171  $0.201    9.0     296,342       4,201    84%  +38%
+  explain    base     3  $0.042  $0.042  $0.040  $0.043    5.3      22,097       1,985    62%
+             head     3  $0.057  $0.060  $0.051  $0.060    6.7      35,708       2,236    64%  +35%
+  principle  base     3  $0.067  $0.071  $0.061  $0.071    7.0      54,757       3,211    77%
+             head     3  $0.095  $0.098  $0.088  $0.098    7.7      67,243       3,889    70%  +41%
+  per run means; cache = cache reads as a share of prompt tokens
+```
+
+(Nine runs of the bench agent, each task run normally and then told to reread files before answering.)
+
+- **Groups.** Runs are compared within groups, so a head that happened to run more of the cheap task doesn't look cheaper. The default group is `gen_ai.agent.name` (the Vercel AI SDK's `functionId`), then the Claude Code project, else all runs in one group. `--group-by <key>` uses any attribute on a trace's root span, such as a task or input id the harness sets. A key that no run has is refused.
+- **Overall.** The headline is the mean of the group means, weighted by base's mix of runs. When the two sides ran groups in different proportions, the plain pooled means are shown too. Groups with runs on one side only are listed and left out.
+- **Noise.** Agent runs vary a lot from run to run (the same task cost $0.11 to $0.24 over three runs in one capture). The verdict comes from a permutation test: within each group, runs are relabeled base/head in every possible way, and the observed change is compared with what relabeling gives. With one run per group on each side this becomes a sign test over the groups. `too few runs` means no outcome of these runs could be told from noise. The noise figure is about two standard errors of the change.
+- **CI.** `--fail-above <pct>` exits 1 when cost per run rose by more than that and the runs show the rise clearly (one-sided p < 0.05). A rise the runs can't separate from noise prints a warning and passes. False alarms in CI are worse than a late catch. A simulation at the run-to-run noise of our bench gave these detection rates with 3 runs per task: a 10% rise about half the time, 15% most of the time (86%), 20% almost always. To catch 10%, use 5 or more runs per task.
+- **What it won't call.** If either side has runs with calls that have no price (an unknown model, or no usage), the verdict is `can't tell`, and `--fail-above` exits 2. Add the price with `--prices`. Runs with a failed call are counted per side. A failed run usually stops early and costs less, so the output notes when head has more of them. A change of model is noted as a trade-off: cost alone doesn't show whether the work still gets done.
+- A run is counted as in `audit`: an OTLP trace, or a Claude Code session with its sub-agents.
 
 ## Recording a running agent
 
@@ -155,14 +189,14 @@ Checked against AI SDK 7.0.157 with `@ai-sdk/otel` 1.0.157, on real captures (`f
 
 ## Status
 
-v0.1. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), three rules, cost per run, table / JSON / Markdown output, `record` for OTLP/HTTP JSON.
+v0.1. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP JSON.
 
 Next:
 
 - More rules: `oversized-tool-result`, `retry-loop`, `context-growth`
 - Protobuf in `burnlint record`, so agents that cannot switch to `http/json` can be recorded too
 - Dialect mappers checked against real exports: Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans, OpenInference, OpenAI Agents SDK, LangGraph
-- `burnlint diff` for comparing a branch against a baseline in CI
+- Outcomes (pass/fail per run), so `diff` can report cost per successful run; then a GitHub Action
 
 ## Development
 

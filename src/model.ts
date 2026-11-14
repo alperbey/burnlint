@@ -112,6 +112,12 @@ export interface Run {
   session?: string;
   /** Last segment of the folder the agent worked in, when the source records it. */
   project?: string;
+  /**
+   * Attributes that say what the run was, for grouping runs in `diff`: OTLP
+   * root-span attributes (short scalar values only, never content), the agent
+   * name and the service name. Never printed unless asked for by key.
+   */
+  labels?: Record<string, string>;
   turns: Turn[];
   /** Notes about data quality, shown in the report. */
   notes: string[];

@@ -9,7 +9,8 @@ import { renderMarkdown, renderTable } from "../src/report.js";
 import { ccAssistant, ccUser, jsonl } from "./helpers.js";
 
 const runOf = (id: string, extra: Partial<RunSummary> = {}): RunSummary => ({
-  id, file: `/logs/${id.split("#")[0]}.jsonl`, source: "claude-code", calls: 10, pricedCalls: 10, failedCalls: 0, costUsd: 5, unpricedModels: [], notes: [], ...extra,
+  id, file: `/logs/${id.split("#")[0]}.jsonl`, source: "claude-code", calls: 10, pricedCalls: 10, failedCalls: 0, costUsd: 5, unpricedModels: [], models: [], promptTokens: 0, outputTokens: 0,
+  cacheReadTokens: 0, cacheUnknownCalls: 0, labels: {}, notes: [], ...extra,
 });
 
 const finding = (runId: string, extra: Partial<Finding>): Finding => ({
