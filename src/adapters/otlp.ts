@@ -314,9 +314,10 @@ const MAX_LABEL_LENGTH = 200;
  */
 function labelsOf(list: Span[]): Record<string, string> {
   const ids = new Set(list.map((s) => s.spanId));
-  const labels: Record<string, string> = {};
+  // No prototype, so an attribute named "constructor" or "__proto__" is an ordinary key.
+  const labels: Record<string, string> = Object.create(null);
   const keep = (key: string, value: unknown) => {
-    if (key in labels || CONTENT_KEY.test(key)) return;
+    if (Object.hasOwn(labels, key) || CONTENT_KEY.test(key)) return;
     if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") return;
     const v = String(value);
     if (v && v.length <= MAX_LABEL_LENGTH) labels[key] = v;
@@ -330,7 +331,8 @@ function labelsOf(list: Span[]): Record<string, string> {
   for (const s of list) keep("gen_ai.agent.name", s.attrs["ai.telemetry.functionId"]);
   const service = list.find((s) => s.service)?.service;
   if (service) keep("service.name", service);
-  return labels;
+  // A plain object again; spreading defines "__proto__" as an own key, it never sets the prototype.
+  return { ...labels };
 }
 
 /** Whole prompt of a call: uncached input plus cache reads and writes. null when unknown. */

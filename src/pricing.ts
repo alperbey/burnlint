@@ -28,7 +28,8 @@ export class PriceTable {
   readonly retrieved: string;
 
   constructor(overrides?: Record<string, Partial<Price>>) {
-    this.models = { ...bundled.models };
+    // No prototype: a model named "constructor" or "__proto__" is just an unknown model.
+    this.models = Object.assign(Object.create(null) as Record<string, Price>, bundled.models);
     for (const [id, p] of Object.entries(overrides ?? {})) {
       this.models[id] = { ...(this.models[id] ?? emptyPrice()), ...p } as Price;
     }

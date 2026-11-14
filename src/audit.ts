@@ -93,17 +93,39 @@ export interface AuditOptions {
 const SEVERITY_RANK: Record<Severity, number> = { high: 3, medium: 2, low: 1, info: 0 };
 export const severityRank = (s: Severity) => SEVERITY_RANK[s];
 
-export function collectFiles(paths: string[]): string[] {
+/**
+ * Trace files under `paths`. A named path that can't be read throws. Inside a
+ * scanned folder, a sub-folder or trace file that can't be read (a dangling
+ * symlink, no permission) is added to `unreadable` and the scan goes on.
+ */
+export function collectFiles(paths: string[], unreadable: string[] = []): string[] {
   const out: string[] = [];
-  const walk = (p: string) => {
-    const st = statSync(p);
+  const isTrace = (p: string) => [".jsonl", ".json"].includes(extname(p));
+  const reason = (e: unknown) => (e as NodeJS.ErrnoException).code ?? (e as Error).message;
+  const walk = (p: string, named: boolean) => {
+    let st;
+    try {
+      st = statSync(p);
+    } catch (e) {
+      if (named) throw e;
+      if (isTrace(p)) unreadable.push(`${p} (${reason(e)})`);
+      return;
+    }
     if (st.isDirectory()) {
-      for (const name of readdirSync(p).sort()) walk(join(p, name));
-    } else if ([".jsonl", ".json"].includes(extname(p))) {
+      let names: string[];
+      try {
+        names = readdirSync(p).sort();
+      } catch (e) {
+        if (named) throw e;
+        unreadable.push(`${p} (${reason(e)})`);
+        return;
+      }
+      for (const name of names) walk(join(p, name), false);
+    } else if (isTrace(p)) {
       out.push(p);
     }
   };
-  for (const p of paths) walk(p);
+  for (const p of paths) walk(p, true);
   return out;
 }
 
@@ -130,9 +152,9 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
   const config = { ...defaultConfig, ...opts.config };
   const active = opts.rules === false ? [] : opts.only?.length ? rules.filter((r) => opts.only!.includes(r.id)) : rules;
 
-  const files = collectFiles(paths);
-  const named = new Set(paths.filter((p) => statSync(p).isFile()));
   const skippedFiles: string[] = [];
+  const files = collectFiles(paths, skippedFiles);
+  const named = new Set(paths.filter((p) => statSync(p).isFile()));
   const ignoredFiles: string[] = [];
   const summaries: RunSummary[] = [];
   const findings: Finding[] = [];

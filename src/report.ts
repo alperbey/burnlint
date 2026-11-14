@@ -3,6 +3,7 @@ import { basename, extname, relative, sep } from "node:path";
 import type { AuditResult, RunSummary } from "./audit.js";
 import { SIGNIFICANCE, type DiffResult } from "./diff.js";
 import type { Finding } from "./model.js";
+import { escapeMd, plainDeep } from "./text.js";
 
 const usd = (n: number | null): string =>
   n == null ? "?" : n < 0 ? `-${usd(-n)}` : n >= 100 ? `$${n.toFixed(0)}` : n >= 1 ? `$${n.toFixed(2)}` : n >= 0.01 ? `$${n.toFixed(3)}` : n > 0 ? `$${n.toFixed(4)}` : "$0";
@@ -34,7 +35,8 @@ export interface TableOptions {
   width?: number;
 }
 
-export function renderTable(r: AuditResult, opts: TableOptions = {}): string {
+export function renderTable(result: AuditResult, opts: TableOptions = {}): string {
+  const r = plainDeep(result);
   const c = (code: string, s: string) => (opts.color && s ? `\x1b[${code}m${s}\x1b[0m` : s);
   const dim = (s: string) => c("2", s);
   const runs = new Map(r.runs.map((run) => [run.id, run]));
@@ -110,7 +112,8 @@ function hanging(lead: string, text: string, width?: number): string[] {
 
 const SEV_COLOR: Record<string, string> = { high: "1;31", medium: "33", low: "0", info: "2" };
 
-export function renderMarkdown(r: AuditResult): string {
+export function renderMarkdown(result: AuditResult): string {
+  const r = plainDeep(result);
   const runs = new Map(r.runs.map((run) => [run.id, run]));
   const out: string[] = [];
   out.push(`### burnlint`);
@@ -260,10 +263,6 @@ function wrap(text: string, width: number): string[] {
   return lines;
 }
 
-function escapeMd(s: string): string {
-  return s.replace(/\|/g, "\\|").replace(/\n/g, " ");
-}
-
 // --- diff ---------------------------------------------------------------------
 
 const signedPct = (x: number | null) => {
@@ -304,7 +303,8 @@ export function verdictLine(r: DiffResult): string {
   }
 }
 
-export function renderDiffTable(r: DiffResult, opts: TableOptions = {}): string {
+export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): string {
+  const r = plainDeep(result);
   const c = (code: string, s: string) => (opts.color && s ? `\x1b[${code}m${s}\x1b[0m` : s);
   const dim = (s: string) => c("2", s);
   const out: string[] = [];

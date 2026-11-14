@@ -9,6 +9,7 @@ import { PriceTable, type Price } from "./pricing.js";
 import { DEFAULT_PORT, PROTOBUF_HINT, defaultRecordFile, startRecorder } from "./record.js";
 import { renderDiffJson, renderDiffTable, renderJson, renderMarkdown, renderTable, verdictLine } from "./report.js";
 import { defaultConfig, rules } from "./rules/index.js";
+import { plainText } from "./text.js";
 
 // dist/src/cli.js -> package.json, in the repo and in an installed package alike.
 const VERSION: string = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;
@@ -62,7 +63,8 @@ Record:
   -v, --verbose                  Log every export received
 `;
 
-const err = (line: string) => process.stderr.write(line + "\n");
+// Error lines can carry label keys, paths and parser messages from a trace.
+const err = (line: string) => process.stderr.write(plainText(line) + "\n");
 
 /** Options each command takes. Anything else on the command line is refused, not ignored. */
 const COMMAND_OPTIONS: Record<string, string[]> = {
@@ -250,9 +252,9 @@ async function main(argv: string[]): Promise<number> {
     return command || values.help ? 0 : 2;
   }
 
-  const allowed = COMMAND_OPTIONS[command];
+  const allowed = Object.hasOwn(COMMAND_OPTIONS, command) ? COMMAND_OPTIONS[command] : undefined;
   if (!allowed) {
-    process.stderr.write(`unknown command: ${command}\n\n${HELP}`);
+    process.stderr.write(`unknown command: ${plainText(command)}\n\n${HELP}`);
     return 2;
   }
   const given = new Set(tokens.flatMap((t) => (t.kind === "option" ? [t.name] : [])));
@@ -356,7 +358,7 @@ main(process.argv.slice(2)).then(
     process.exitCode = code;
   },
   (e) => {
-    process.stderr.write(`burnlint: ${(e as Error).message}\n`);
+    err(`burnlint: ${(e as Error).message}`);
     process.exitCode = 2;
   },
 );

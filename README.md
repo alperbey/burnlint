@@ -145,7 +145,7 @@ Severity is set by what fixing the finding would save: `high` from $1, `medium` 
 
 ## How costs are calculated
 
-- Prices come from a bundled snapshot of LiteLLM's model price table (MIT), with the retrieval date shown in every report. Override or add models with `--prices prices.json` (USD per 1M tokens: `input`, `output`, `cacheRead`, `cacheWrite5m`, `cacheWrite1h`). Refresh with `npm run update-prices`.
+- Prices come from a bundled snapshot of LiteLLM's model price table (MIT), with the retrieval date shown in every report. Override or add models with `--prices prices.json` (USD per 1M tokens: `input`, `output`, `cacheRead`, `cacheWrite5m`, `cacheWrite1h`). In a clone of this repo, `npm run update-prices` refreshes the snapshot.
 - Cache reads and 5-minute vs 1-hour cache writes are priced separately when the source reports them.
 - Missing data is treated as unknown, never as zero:
   - Calls without usage are left unpriced and counted in the notes.
@@ -192,12 +192,14 @@ Checked against AI SDK 7.0.157 with `@ai-sdk/otel` 1.0.157, on real captures (`f
 
 v0.1. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP JSON.
 
+While the version is 0.x, the fields of `-f json` output may change between minor versions; changes are noted in the release notes.
+
 Next:
 
-- More rules: `oversized-tool-result`, `retry-loop`, `context-growth`
 - Protobuf in `burnlint record`, so agents that cannot switch to `http/json` can be recorded too
-- Dialect mappers checked against real exports: Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans, OpenInference, OpenAI Agents SDK, LangGraph
+- Dialect mappers checked against real exports: OpenAI Agents SDK, LangGraph and OpenInference first, then Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans
 - Outcomes (pass/fail per run), so `diff` can report cost per successful run; then a GitHub Action
+- More rules (`oversized-tool-result`, `retry-loop`, `context-growth`) once real traces show money there
 
 ## Development
 

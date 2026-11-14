@@ -127,11 +127,11 @@ export function compare(
 ): DiffResult {
   const all = [...baseRuns, ...headRuns];
   let groupBy = opts.groupBy;
-  if (groupBy !== undefined && !all.some((r) => r.labels[groupBy!] !== undefined)) {
+  if (groupBy !== undefined && !all.some((r) => label(r, groupBy!) !== undefined)) {
     const known = [...new Set(all.flatMap((r) => Object.keys(r.labels)))].sort();
     throw new GroupKeyError(`no run has "${groupBy}"${known.length ? ` (keys found: ${known.join(", ")})` : ""}`);
   }
-  groupBy ??= DEFAULT_GROUP_KEYS.find((k) => all.some((r) => r.labels[k] !== undefined));
+  groupBy ??= DEFAULT_GROUP_KEYS.find((k) => all.some((r) => label(r, k) !== undefined));
 
   const base = units(baseRuns, groupBy);
   const head = units(headRuns, groupBy);
@@ -168,6 +168,9 @@ export function compare(
   return result;
 }
 
+/** A run's own label, never one inherited from Object (`--group-by constructor`). */
+const label = (r: RunSummary, key: string): string | undefined => (Object.hasOwn(r.labels, key) ? r.labels[key] : undefined);
+
 /** Runs summed into units of work (a Claude Code session with its sub-agents), each with its group. */
 function units(runs: RunSummary[], groupBy: string | undefined): Unit[] {
   return unitsOf(runs).map((rs) => {
@@ -178,7 +181,7 @@ function units(runs: RunSummary[], groupBy: string | undefined): Unit[] {
     const failed = sum((r) => r.failedCalls);
     const calls = sum((r) => r.calls);
     return {
-      group: groupBy === undefined ? "all runs" : (main.labels[groupBy] ?? `(no ${groupBy})`),
+      group: groupBy === undefined ? "all runs" : (label(main, groupBy) ?? `(no ${groupBy})`),
       cost: sum((r) => r.costUsd),
       counted: priced > 0,
       failed: failed > 0,

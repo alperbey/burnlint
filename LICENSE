@@ -20,5 +20,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Pricing data in src/pricing/prices.json is derived from LiteLLM's
+Pricing data in src/pricing/prices.json (dist/src/pricing/prices.json in the
+npm package) is derived from LiteLLM's
 model_prices_and_context_window.json, Copyright (c) 2023 Berri AI, MIT License.
