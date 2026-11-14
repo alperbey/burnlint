@@ -55,7 +55,7 @@ test("one group of 3 against 3 can't reach p < 0.05 two-sided: too few runs, and
   assert.equal(o.verdict, "too few runs");
   // One-sided p is 0.05, not below it: a rise the runs can't show clearly passes.
   assert.equal(gate(r, 10), "unclear");
-  assert.match(renderDiffTable(r), /too few runs to tell/);
+  assert.match(renderDiffTable(r), /too few runs to tell.*--group-by/s);
 });
 
 test("a different mix of groups doesn't pass for a change in cost", () => {
@@ -195,6 +195,8 @@ test("diff refuses what it can't use", () => {
   assert.equal(run("diff", f, f, "-f", "md").status, 2);
   assert.equal(run("diff", f, f, "--rule", "cache-thrash").status, 2);
   assert.equal(run("audit", f, "--fail-above", "10").status, 2);
+  // Priced runs on both sides but no group in common: nothing was compared.
+  assert.equal(run("diff", fixture("ai-sdk-v7-nocache.jsonl"), fixture("ai-sdk-v7-prefix.jsonl")).status, 2);
   // Same runs on both sides: nothing rose, so the gate passes.
   assert.equal(run("diff", f, f, "--fail-above", "0").status, 0);
 });

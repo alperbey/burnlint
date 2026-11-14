@@ -291,7 +291,12 @@ export function verdictLine(r: DiffResult): string {
     case "no clear change":
       return `no clear change: ${ch} is within run-to-run noise (${pValue(o.pTwoSided)})`;
     case "too few runs":
-      return `too few runs to tell (${ch}): no difference these runs could show would reach p<${SIGNIFICANCE}`;
+      return (
+        `too few runs to tell (${ch}): no difference these runs could show would reach p<${SIGNIFICANCE}` +
+        (r.groups.length === 1 && r.groups[0]!.base.runs + r.groups[0]!.head.runs < 8
+          ? `. Run more, or label each run with its task (a root-span attribute) and use --group-by: groups of the same task vary less`
+          : "")
+      );
     case "can't tell": {
       const n = r.base.unpriced + r.head.unpriced;
       return `can't tell: ${plural(n, "run")} with calls that have no price or no usage, so their cost is unknown`;

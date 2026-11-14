@@ -36,6 +36,10 @@
 //   --max-steps 15 (answer phase; the check phase gets 8)
 //   --budget 15 (USD, all runs)  --run-cap 1.5 (USD, one run)
 //   --repo ../..    --model claude-sonnet-5-5
+//   --snapshot 4233b57  commit the tools see, checked out into a temporary git
+//                    worktree, so runs on different days see the same code
+//                    ("live" = the working tree as it is; runs before
+//                    2026-11-14 used it, and their tree was 4233b57)
 //   --grade <dir>   re-grade saved answers (<...>-<task>-<variant>-...md) and exit.
 //   --mock          scripted model, no API key, no cost: checks the pipeline only.
 //                   Its traces are not real and must never become a fixture.
@@ -46,7 +50,8 @@
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { trace, diag, DiagLogLevel } from "@opentelemetry/api";
@@ -69,13 +74,33 @@ const { values: opt } = parseArgs({
     budget: { type: "string", default: "15" },
     "run-cap": { type: "string", default: "1.5" },
     repo: { type: "string", default: "../.." },
+    snapshot: { type: "string", default: "4233b57" },
     model: { type: "string", default: "claude-sonnet-5-5" },
     mock: { type: "boolean", default: false },
     grade: { type: "string" },
   },
 });
 
-const REPO = resolve(opt.repo);
+// The code under review changes as the project grows; a run that reads more
+// costs more. Tools read a pinned commit so that cost differences between
+// batches come from the agent, not from the code it reads.
+const SNAPSHOT = opt.snapshot === "live" ? undefined : opt.snapshot;
+if (SNAPSHOT !== undefined && !/^[0-9a-f]{7,40}$/.test(SNAPSHOT)) throw new Error("--snapshot must be a commit hash or live");
+const REPO = SNAPSHOT ? checkout(resolve(opt.repo), SNAPSHOT) : resolve(opt.repo);
+
+function checkout(repo, commit) {
+  const dir = mkdtempSync(join(tmpdir(), `bench-${commit}-`));
+  execFileSync("git", ["-C", repo, "worktree", "add", "--detach", "--quiet", dir, commit]);
+  process.on("exit", () => {
+    try {
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", dir]);
+    } catch (e) {
+      console.error(`could not remove worktree ${dir}: ${e.message}`);
+    }
+  });
+  for (const sig of ["SIGINT", "SIGTERM"]) process.once(sig, () => process.exit(130));
+  return dir;
+}
 const MAX_STEPS = Number(opt["max-steps"]);
 const CHECK_STEPS = 8;
 const REPEAT = Number(opt.repeat);
@@ -305,7 +330,7 @@ async function runOnce(model, task, variant, rep, batch, tracer) {
   const label = `${task}-${variant}-${rep}-${opt.telemetry}${opt.mock ? "-mock" : ""}`;
   return tracer.startActiveSpan(
     "bench.run",
-    { attributes: { "bench.task": task, "bench.variant": variant, "bench.rep": rep, "bench.batch": batch } },
+    { attributes: { "bench.task": task, "bench.variant": variant, "bench.rep": rep, "bench.batch": batch, "bench.snapshot": SNAPSHOT ?? "live" } },
     async (span) => {
       const traceId = span.spanContext().traceId;
       const started = Date.now();

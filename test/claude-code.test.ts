@@ -1,7 +1,10 @@
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { readClaudeCode } from "../src/adapters/claude-code.js";
-import { loadRuns } from "../src/audit.js";
+import { audit, loadRuns } from "../src/audit.js";
 import { callCost, PriceTable } from "../src/pricing.js";
 import { ccAssistant, ccToolResult, ccUser, jsonl, tmpFile } from "./helpers.js";
 
@@ -115,4 +118,50 @@ test("sidechain records become a separate run", () => {
   const runs = readClaudeCode(file);
   assert.equal(runs.length, 2);
   assert.ok(runs.some((r) => r.agent === "agent-1"));
+});
+
+test("real Claude Code session (redacted): cost and cache-thrash match an independent calculation", () => {
+  const file = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "fixtures", "claude-code-session.jsonl");
+  const [run, ...rest] = readClaudeCode(file);
+  assert.equal(rest.length, 0);
+  assert.equal(run!.project, "scratch-2026-10-27-53a77d");
+  assert.equal(run!.turns.length, 44);
+
+  // Usage counted once per message id, priced from Anthropic's page for Claude
+  // Opus 5.5 (2026-11): input $4, output $20, cache read $0.20, 1h write 2x = $8.
+  const records = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const calls: Array<{ ts: string; u: Record<string, any> }> = [];
+  const seen = new Set<string>();
+  for (const d of records)
+    if (d.type === "assistant" && !seen.has(d.message.id)) {
+      seen.add(d.message.id);
+      calls.push({ ts: d.timestamp, u: d.message.usage });
+    }
+  const sum = (f: (u: Record<string, any>) => number) => calls.reduce((s, c) => s + f(c.u), 0);
+  const expected =
+    (sum((u) => u.input_tokens) * 4 +
+      sum((u) => u.output_tokens) * 20 +
+      sum((u) => u.cache_read_input_tokens) * 0.2 +
+      sum((u) => u.cache_creation.ephemeral_5m_input_tokens) * 5 +
+      sum((u) => u.cache_creation.ephemeral_1h_input_tokens) * 8) /
+    1e6;
+  const result = audit([file]);
+  assert.ok(Math.abs(result.totalCostUsd - expected) < 1e-9, `${result.totalCostUsd} vs ${expected}`);
+
+  // One cache rewrite at the second call, after a 3h35m break. Lost: what the
+  // first call left cached (its reads and writes) minus what the second read,
+  // rewritten at the 1h write rate less the read rate. Net of a keep-alive that
+  // re-reads the first call's whole prompt every 55 minutes of the break.
+  const [a, b] = calls as [(typeof calls)[0], (typeof calls)[0]];
+  const cachedAfterA = a.u.cache_read_input_tokens + a.u.cache_creation_input_tokens;
+  const lost = Math.min(cachedAfterA - b.u.cache_read_input_tokens, b.u.cache_creation.ephemeral_1h_input_tokens);
+  const gapMin = (Date.parse(b.ts) - Date.parse(a.ts)) / 60000;
+  const pings = Math.floor(gapMin / 55);
+  const promptA = a.u.input_tokens + cachedAfterA;
+  const [f, ...others] = result.findings;
+  assert.equal(others.length, 0);
+  assert.equal(f!.rule, "cache-thrash");
+  assert.match(f!.message, /after 3h35m idle, within the 12h keep-alive/);
+  assert.ok(Math.abs(f!.costUsd! - (lost * 7.8) / 1e6) < 1e-12);
+  assert.ok(Math.abs(f!.avoidableUsd! - ((lost * 7.8) / 1e6 - (pings * promptA * 0.2) / 1e6)) < 1e-12);
 });

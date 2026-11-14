@@ -230,6 +230,16 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
 /** The unit a run summary belongs to: its session (sub-agents share their parent's), else itself. */
 export const unitOf = (r: RunSummary) => r.session ?? r.id;
 
+/** Run summaries gathered into units of work, in first-seen order. */
+export function unitsOf(summaries: RunSummary[]): RunSummary[][] {
+  const units = new Map<string, RunSummary[]>();
+  for (const r of summaries) {
+    if (!units.has(unitOf(r))) units.set(unitOf(r), []);
+    units.get(unitOf(r))!.push(r);
+  }
+  return [...units.values()];
+}
+
 /**
  * Runs with no priced call are left out: a run that failed before its first
  * answer would otherwise count as a $0 run and pull the median down. They are
@@ -240,16 +250,13 @@ function perRunCosts(
   total: number,
   avoidable: number,
 ): { perRun: PerRun | null; excludedRuns: AuditResult["excludedRuns"] } {
-  const units = new Map<string, { cost: number; calls: number; priced: number; failed: number }>();
-  for (const r of summaries) {
-    const u = units.get(unitOf(r)) ?? { cost: 0, calls: 0, priced: 0, failed: 0 };
-    u.cost += r.costUsd;
-    u.calls += r.calls;
-    u.priced += r.pricedCalls;
-    u.failed += r.failedCalls;
-    units.set(unitOf(r), u);
-  }
-  const all = [...units.values()];
+  const sum = (rs: RunSummary[], f: (r: RunSummary) => number) => rs.reduce((s, r) => s + f(r), 0);
+  const all = unitsOf(summaries).map((rs) => ({
+    cost: sum(rs, (r) => r.costUsd),
+    calls: sum(rs, (r) => r.calls),
+    priced: sum(rs, (r) => r.pricedCalls),
+    failed: sum(rs, (r) => r.failedCalls),
+  }));
   const counted = all.filter((u) => u.priced > 0);
   const excluded = all.filter((u) => u.priced === 0);
   const excludedRuns = { failed: excluded.filter((u) => u.failed > 0).length, unpriced: excluded.filter((u) => u.failed === 0).length };

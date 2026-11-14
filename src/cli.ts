@@ -41,8 +41,9 @@ Diff:
       --group-by <key>           Run label to group by (default: gen_ai.agent.name, else the
                                  Claude Code project, else one group), e.g. a root-span attribute
       --fail-above <pct>         Exit 1 if cost per run rose more than this many percent and the
-                                 runs show the rise clearly (one-sided p < 0.05). A rise the runs
-                                 can't tell from noise passes. With 3 runs per group, only rises
+                                 runs show a rise clearly (one-sided p < 0.05). A rise the runs
+                                 can't tell from noise passes. Inputs must be the same on both
+                                 sides: a task that reads a growing repo costs more by itself. With 3 runs per group, only rises
                                  of 15-20% or more are reliably seen; use 5+ runs for 10%.
   -f, --format <table|json>      Output format (default: table)
       --prices <file.json>       Price overrides, as for audit
@@ -191,6 +192,10 @@ function runDiff(paths: string[], values: { format: string; "group-by"?: string;
       err(`burnlint: no priced runs in ${name} (${side.paths.join(", ")}); nothing to compare`);
       return 2;
     }
+  }
+  if (!result.overall) {
+    err(`burnlint: no group has priced runs on both sides; nothing was compared`);
+    return 2;
   }
   if (failAbove === undefined) return 0;
   const g = gate(result, failAbove);

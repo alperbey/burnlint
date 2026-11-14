@@ -1,4 +1,4 @@
-import { audit, unitOf, type AuditOptions, type AuditResult, type RunSummary } from "./audit.js";
+import { audit, unitOf, unitsOf, type AuditOptions, type AuditResult, type RunSummary } from "./audit.js";
 
 /**
  * Cost per run before and after a change. Runs are compared within groups
@@ -170,13 +170,7 @@ export function compare(
 
 /** Runs summed into units of work (a Claude Code session with its sub-agents), each with its group. */
 function units(runs: RunSummary[], groupBy: string | undefined): Unit[] {
-  const byUnit = new Map<string, RunSummary[]>();
-  for (const r of runs) {
-    const key = unitOf(r);
-    if (!byUnit.has(key)) byUnit.set(key, []);
-    byUnit.get(key)!.push(r);
-  }
-  return [...byUnit.values()].map((rs) => {
+  return unitsOf(runs).map((rs) => {
     // The main run's labels name the unit; a sub-agent's may differ.
     const main = rs.find((r) => r.id === unitOf(r)) ?? rs[0]!;
     const sum = (f: (r: RunSummary) => number) => rs.reduce((s, r) => s + f(r), 0);
@@ -379,8 +373,10 @@ function mulberry32(seed: number): () => number {
 }
 
 /**
- * The CI gate: fail only on a rise above the threshold that the runs show
- * clearly (one-sided). A rise the runs can't separate from noise passes.
+ * The CI gate: fail when the measured rise is above the threshold and the runs
+ * show a rise clearly (one-sided p for any rise). It doesn't test that the
+ * rise exceeds the threshold: with many runs, a measured 10.5% with a wide
+ * spread fails a 10% gate. A rise the runs can't separate from noise passes.
  */
 export function gate(r: DiffResult, failAbovePct: number): "fail" | "pass" | "unclear" | "can't tell" {
   const o = r.overall;
