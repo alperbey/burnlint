@@ -12,8 +12,9 @@ Decided 2026-11-14 (Alper): `diff` fast-forwarded into `main` (ca5ac2e) and push
 
 API keys on this Mac, in the Keychain (services `anthropic-api-key`, `openai-api-key`, `gemini-api-key`, `deepseek-api-key`), each checked against a free endpoint. `~/.zshrc` has `withkeys <vendor,...> <cmd>` (sets the key only for that command; gemini sets `GEMINI_API_KEY` and `GOOGLE_GENERATIVE_AI_API_KEY`) and `storekey <vendor>` (stores the key on the clipboard; the `security -w` prompt cut a 164-char OpenAI key to 128).
 
+Published `burnlint@0.1.0` on 2026-11-14 (`latest`; tag `v0.1.0` = 4858f1e, moved there after the pre-publish review's fixes). The published `dist.shasum` (49110a46…) equals a local `npm pack` of that commit; `npx burnlint@0.1.0` installs and runs `--version`, `--help` and `audit` from an empty folder. npm's staged publishing left a `0.0.0-stage` placeholder version (2 files, "Temporary package placeholder for staged publishing"). Pre-publish review (Fable 5.2, independent): no blockers; fixed before publishing: trace text made inert in terminal and Markdown output (control characters, bidi overrides, HTML, links, @mentions), unreadable entries inside a scanned folder reported instead of fatal, Object property names (`constructor`, `toString`) treated as ordinary names, `dist/` cleaned before build, README/LICENSE paths for npm users. Left for later: the Keychain lines in this file (public on GitHub, no key material), `record` accepting a foreign `Host` header (write-only DNS rebinding), `npm test` needing Node 21+ for its glob, 3 commits authored with a LAN-address email from the other machine (set `user.email` there).
+
 Still open:
-4. Publish: needs Alper's `npm login`. Public and permanent.
 5. Label keys the content filter drops (`bench.input_id`, `bench.context`): let the user allow keys explicitly. Later.
 
 Prompt to resume in a new session:

@@ -83,11 +83,12 @@ Done:
 - Real captures, Vercel AI SDK 7 on Claude Sonnet 5.5 (both span formats; bench in `bench/ai-sdk/`, Alper runs it on his key, about $12 so far): cost and savable match independent checks on every captured run, and each rule fires on its wasteful variant and stays silent on normal runs.
 - `burnlint diff <base> <head>` v1 (2026-11-13/14). Runs compared within groups (`Run.labels`: OTLP root-span scalar attributes, never content keys, plus `gen_ai.agent.name`, filled from `ai.telemetry.functionId`; Claude Code `project`), overall at base's mix, stratified permutation test, `--fail-above` fails only on a clear rise, unpriced calls make it `can't tell`. Checked: +38% on a wasteful variant matches an independent recomputation; A/A on a pinned bench gives -0.9%, p=0.81; over all 8,000 3v3 splits of 18 same-setup runs the gate fires 0.09% at 10%. Inputs must be pinned on both sides (the bench reads a fixed commit, `--snapshot`).
 
+- Published `burnlint@0.1.0` to npm (2026-11-14, tag `v0.1.0`, 4858f1e). Alper runs `npm publish --auth-type=web` in his own terminal (security-key 2FA; a non-interactive shell gets EOTP). npm stages a first publish (`0.0.0-stage` placeholder, then the real version). Before each publish: `npm publish --dry-run`, a tarball install, and compare the published `dist.shasum` with a local `npm pack`.
+
 Next, in order:
-1. Publish 0.1 to npm (name `burnlint` still free on 2026-11-14). Needs Alper's npm login; public and permanent, so check `npm pack --dry-run` and a tarball install first.
-2. Protobuf in `record`: a hand-written decoder for the trace messages, no dependency.
-3. A second builder framework, from a real capture: OpenAI Agents SDK, or LangGraph via OpenInference.
-4. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
+1. Protobuf in `record`: a hand-written decoder for the trace messages, no dependency.
+2. A second builder framework, from a real capture: OpenAI Agents SDK, or LangGraph via OpenInference.
+3. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
 
 Later, unordered:
 - `diff`: findings added/removed; Markdown output; a GitHub Action; let the user allow label keys the content filter drops (`bench.input_id`, `bench.context`; Alper, 2026-11-14).
