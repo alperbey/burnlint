@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpFile } from "./helpers.js";
@@ -28,6 +29,13 @@ test("json output parses", () => {
   const j = JSON.parse(r.stdout);
   assert.equal(j.runs.length, 1);
   assert.equal(j.findings[0].rule, "reread-unchanged");
+});
+
+test("--version prints the package version", () => {
+  const r = run("--version");
+  assert.equal(r.status, 0, r.stderr);
+  const { version } = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  assert.equal(r.stdout, `${version}\n`);
 });
 
 test("bad input exits 2", () => {

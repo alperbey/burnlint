@@ -10,7 +10,10 @@ import { DEFAULT_PORT, PROTOBUF_HINT, defaultRecordFile, startRecorder } from ".
 import { renderDiffJson, renderDiffTable, renderJson, renderMarkdown, renderTable, verdictLine } from "./report.js";
 import { defaultConfig, rules } from "./rules/index.js";
 
-const HELP = `burnlint — find wasted tokens and money in agent traces
+// dist/src/cli.js -> package.json, in the repo and in an installed package alike.
+const VERSION: string = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;
+
+const HELP = `burnlint — cost per run for AI agents, and the avoidable part
 
 Usage:
   burnlint audit [paths...]   Lint trace files or folders
@@ -32,6 +35,7 @@ Options:
       --runs-per-month <n>       Project spend and avoidable spend to this many runs a month
   -v, --verbose                  Show each occurrence, file paths and all notes
   -h, --help
+      --version
 
 Diff:
   Runs the same tasks before (base) and after (head) a change; each side is a trace file or a
@@ -232,9 +236,14 @@ async function main(argv: string[]): Promise<number> {
       port: { type: "string" },
       verbose: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
+      version: { type: "boolean", default: false },
     },
   });
 
+  if (values.version) {
+    process.stdout.write(`${VERSION}\n`);
+    return 0;
+  }
   const [command, ...paths] = positionals;
   if (values.help || !command) {
     process.stdout.write(HELP);

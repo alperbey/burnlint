@@ -75,15 +75,28 @@ Vercel AI SDK 7.0.157 + @ai-sdk/otel 1.0.157 + @ai-sdk/anthropic 4.0.92, Claude 
 
 NOTES.md holds the dated log of captures, checks and decisions; keep this section to the current state.
 
-Done: `burnlint record` (OTLP/HTTP JSON; traces only, logs and metrics acknowledged and dropped; protobuf refused with 415 and a hint to set `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`). Still open, to decide with Alper: protobuf decoding (a dependency, or a hand-written decoder for the trace messages) or keep documenting `http/json`. Checked only against the OTel JS exporter so far.
+Order set by Alper on 2026-11-14, after the independent progress review: the biggest risk is that nobody outside has used burnlint, so publish first, then widen what it reads, then outcomes. New rules wait until a real user's trace shows money there.
 
-1. Done: cost per run (`perRun` in `audit.ts`): count, mean, median, p90 and max cost per run, avoidable per run and as a share of spend; `--runs-per-month` projects both to a month. A run here is the unit of work: a Claude Code session with its sub-agents (grouped by `session`), or one OTLP trace.
-2. Real captures from agent frameworks builders use (OpenAI Agents SDK, LangGraph, Vercel AI SDK, OpenInference), through `record`. Done for the Vercel AI SDK 7 on Claude Sonnet 5.5 (both span formats; bench in `bench/ai-sdk/`, Alper runs it on his key, about $12 so far): cost and savable match independent checks on every captured run, and each rule fires on its wasteful variant and stays silent on normal runs. Open: a second framework; a lost automatic cache on OpenAI/Gemini (they report cache reads but no writes, so `cache-thrash` never fires there; needs a real capture); caching off on a volatile prefix reports nothing; failed legacy `ai.*` runs aren't recognized as model calls; an attempt hidden inside an SDK retry is invisible in the trace (don't flag warm starts as retries). Dated log: NOTES.md.
-3. `burnlint diff <base> <head>`: v1 done (2026-11-13/14). Runs compared within groups (`Run.labels`: OTLP root-span scalar attributes, never content keys, plus `gen_ai.agent.name`, filled from `ai.telemetry.functionId`; Claude Code `project`), overall at base's mix, stratified permutation test, `--fail-above` fails only on a clear rise, unpriced calls make it `can't tell`. Checked: +38% on a wasteful variant matches an independent recomputation; A/A on a pinned bench gives -0.9%, p=0.81; over all 8,000 3v3 splits of 18 same-setup runs the gate fires 0.09% at 10%. Inputs must be pinned on both sides (the bench reads a fixed commit, `--snapshot`). Open: let the user allow label keys the content filter drops (`bench.input_id`, `bench.context`; Alper, 2026-11-14); findings added/removed; Markdown output; a GitHub Action. Dated log: NOTES.md.
+Done:
+- `burnlint record` (OTLP/HTTP JSON; traces only, logs and metrics acknowledged and dropped; protobuf refused with 415 and a hint to set `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`). Checked only against the OTel JS exporter so far.
+- Cost per run (`perRun` in `audit.ts`): count, mean, median, p90 and max cost per run, avoidable per run and as a share of spend; `--runs-per-month` projects both to a month. A run here is the unit of work: a Claude Code session with its sub-agents (grouped by `session`), or one OTLP trace.
+- Real captures, Vercel AI SDK 7 on Claude Sonnet 5.5 (both span formats; bench in `bench/ai-sdk/`, Alper runs it on his key, about $12 so far): cost and savable match independent checks on every captured run, and each rule fires on its wasteful variant and stays silent on normal runs.
+- `burnlint diff <base> <head>` v1 (2026-11-13/14). Runs compared within groups (`Run.labels`: OTLP root-span scalar attributes, never content keys, plus `gen_ai.agent.name`, filled from `ai.telemetry.functionId`; Claude Code `project`), overall at base's mix, stratified permutation test, `--fail-above` fails only on a clear rise, unpriced calls make it `can't tell`. Checked: +38% on a wasteful variant matches an independent recomputation; A/A on a pinned bench gives -0.9%, p=0.81; over all 8,000 3v3 splits of 18 same-setup runs the gate fires 0.09% at 10%. Inputs must be pinned on both sides (the bench reads a fixed commit, `--snapshot`).
+
+Next, in order:
+1. Publish 0.1 to npm (name `burnlint` still free on 2026-11-14). Needs Alper's npm login; public and permanent, so check `npm pack --dry-run` and a tarball install first.
+2. Protobuf in `record`: a hand-written decoder for the trace messages, no dependency.
+3. A second builder framework, from a real capture: OpenAI Agents SDK, or LangGraph via OpenInference.
 4. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
-5. Rules: `oversized-tool-result`, `retry-loop`, `context-growth`. `model-overkill` after outcomes (counterfactual, needs careful wording).
-6. More dialect mappers, each from a real capture: Claude Code OTel spans (`claude_code.*`, needs CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1; tool inputs need OTEL_LOG_TOOL_DETAILS=1), Codex CLI rollout JSONL + OTel, Gemini CLI (`gemini_cli.*`, `outfile` setting), Qwen Code (`qwen-code.*`).
-7. npm publish (name `burnlint` was free on npm, PyPI and GitHub as of Nov 2026). An MCP server over the JSON output is a cheap later add-on, not a priority.
+
+Later, unordered:
+- `diff`: findings added/removed; Markdown output; a GitHub Action; let the user allow label keys the content filter drops (`bench.input_id`, `bench.context`; Alper, 2026-11-14).
+- Capture gaps: a lost automatic cache on OpenAI/Gemini (they report cache reads but no writes, so `cache-thrash` never fires there; needs a real capture); caching off on a volatile prefix reports nothing; failed legacy `ai.*` runs aren't recognized as model calls; an attempt hidden inside an SDK retry is invisible in the trace (don't flag warm starts as retries).
+- Rules, only once a real trace shows money there: `oversized-tool-result`, `retry-loop`, `context-growth`. `model-overkill` after outcomes (counterfactual, needs careful wording).
+- More dialect mappers, each from a real capture: Claude Code OTel spans (`claude_code.*`, needs CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1; tool inputs need OTEL_LOG_TOOL_DETAILS=1), Codex CLI rollout JSONL + OTel, Gemini CLI (`gemini_cli.*`, `outfile` setting), Qwen Code (`qwen-code.*`).
+- An MCP server over the JSON output: a cheap add-on, not a priority.
+
+Dated log of all of the above: NOTES.md.
 
 Benchmark protocol for new sources: 3 fixed tasks, each run normally and with a deliberately wasteful setup, so every rule is shown to fire and to stay silent. For a trade-off rule, also run each task with the suggested fix applied and compare task success (tests pass) and cost; the rule only advises once success holds.
 

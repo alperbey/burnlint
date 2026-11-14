@@ -8,11 +8,12 @@ Branch `diff` (pushed; `main` is still at 4233b57). It holds, on top of main: `n
 
 Not on GitHub: `captures/` (ai-sdk-3 to ai-sdk-7) and `bench/ai-sdk/out/`. They hold prompts and tool results; copy them by hand only if a check needs them. The API key is in this Mac's Keychain (service `anthropic-api-key`); the other machine needs its own.
 
-Open decisions for Alper:
-1. Merge `diff` into `main` (`git checkout main && git merge --ff-only diff`).
-2. Roadmap order. The review suggested: publish 0.1, protobuf in `record` (hand-written decoder, no dependency), a second builder framework (OpenAI Agents SDK, or LangGraph via OpenInference), then outcomes; defer new rules until a real user's trace shows money there. CLAUDE.md still lists the old order.
-3. Gate semantics: keep "measured rise above the threshold and a clear rise", or test a rise above the threshold itself (scale head by 1/(1+t) and test). Changes what burnlint reports.
-4. Publish: needs Alper's npm login; check `package.json` (files, bin, version) and `npm pack --dry-run` first. Public and permanent.
+Decided 2026-11-14 (Alper): `diff` fast-forwarded into `main` (ca5ac2e) and pushed. Roadmap order as the review suggested: publish 0.1, protobuf in `record` (hand-written decoder, no dependency), a second builder framework, then outcomes; new rules deferred. CLAUDE.md updated. Gate semantics kept for 0.1: `--fail-above` fails on a measured rise above the threshold that the runs show clearly (testing a rise above the threshold itself would almost never fire at 3 runs per group; maybe later as an option). Publish prep done: `--version`, `prepublishOnly: npm test`, repository/homepage/bugs, new description and help tagline; a tarball install runs `audit`, `--help` and `--version`; `burnlint` still free on npm.
+
+API keys on this Mac, in the Keychain (services `anthropic-api-key`, `openai-api-key`, `gemini-api-key`, `deepseek-api-key`), each checked against a free endpoint. `~/.zshrc` has `withkeys <vendor,...> <cmd>` (sets the key only for that command; gemini sets `GEMINI_API_KEY` and `GOOGLE_GENERATIVE_AI_API_KEY`) and `storekey <vendor>` (stores the key on the clipboard; the `security -w` prompt cut a 164-char OpenAI key to 128).
+
+Still open:
+4. Publish: needs Alper's `npm login`. Public and permanent.
 5. Label keys the content filter drops (`bench.input_id`, `bench.context`): let the user allow keys explicitly. Later.
 
 Prompt to resume in a new session:
