@@ -21,9 +21,9 @@ burnlint supports P&L decisions about agents. Primary users are people building 
 - `src/adapters/` one reader per source format (`claude-code.ts`, `otlp.ts`)
 - `src/rules/` one pure function per rule, registered in `rules/index.ts`
 - `src/pricing.ts` price lookup, cost math, provider inference/relabeling
-- `src/record.ts` OTLP/HTTP receiver for `record`: appends each trace export as one JSONL line, body written as received
+- `src/record.ts` OTLP/HTTP receiver for `record`: appends each trace export as one JSONL line, JSON written as received, protobuf decoded by `src/otlp-protobuf.ts` (hand-written, no dependency) into the same OTLP/JSON form
 - `src/audit.ts` file discovery, format detection, runs rules; `src/diff.ts` before/after comparison and its permutation test; `src/report.ts` table/json/md; `src/cli.ts`
-- `fixtures/` real traces only (redacted), plus the script that generated each one. `scripts/redact-claude-code.mjs` does the same for a Claude Code session log (allowlist of what the reader uses). `scripts/redact-capture.mjs` turns picked traces of a `record` capture into a fixture (content removed, tool results replaced by same-length filler, equal where equal; numbered file lines keep their numbers and get per-line filler, keyed with a per-run secret)
+- `fixtures/` real traces only (redacted), plus the script that generated each one. `*-exports.ndjson` hold raw OTLP/HTTP request bodies (from `scripts/gen-protobuf-fixture.mjs` and `scripts/gen-protobuf-fixture-python.py`), not trace files; `audit` skips `.ndjson`. `scripts/redact-claude-code.mjs` does the same for a Claude Code session log (allowlist of what the reader uses). `scripts/redact-capture.mjs` turns picked traces of a `record` capture into a fixture (content removed, tool results replaced by same-length filler, equal where equal; numbered file lines keep their numbers and get per-line filler, keyed with a per-run secret)
 - `bench/<framework>/` agents run to capture real traces, each with its own pinned package.json (never a dependency of burnlint). `bench/ai-sdk/agent.mjs`: read-only code reviewer on the Vercel AI SDK, 3 tasks x normal/wasteful/nocache; tools read a pinned commit (`--snapshot`) so batches on different days see the same code. Raw captures go to `captures/` (gitignored: they hold prompts and tool results)
 
 ## Principles
@@ -60,7 +60,13 @@ OTel gen_ai via `opentelemetry-instrumentation-openai-v2` 2.3b0 (2.4b0 is broken
 OTLP/HTTP JSON via `@opentelemetry/exporter-trace-otlp-http` 0.223.2 (sdk-trace-node 2.12.1), captured through `record`:
 - Ids are hex, `startTimeUnixNano` is a string, `intValue` is a JSON number, span `kind` is a number.
 - `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` sends `content-encoding: gzip`.
-- The exporter surfaces the body of an error response (`OTLPExporterError.data`), so the 415 hint for protobuf reaches the user.
+- The exporter surfaces the body of an error response (`OTLPExporterError.data`), so a refusal reason reaches the user.
+
+OTLP/HTTP protobuf (`fixtures/otel-js-exports.ndjson`, `fixtures/otel-python-exports.ndjson`, raw request bodies):
+- JS `exporter-trace-otlp-proto` 0.223.2 sends `content-type: application/x-protobuf`. Decoded, its bodies equal what `exporter-trace-otlp-http` 0.223.2 sends for the same spans, except defaults protobuf leaves off the wire (zero dropped counts, empty events/links, status code 0).
+- Python `opentelemetry-exporter-otlp-proto-http` 1.45.2 (protobuf 7.36.2) decodes to the SDK's in-memory spans; it sets span and link `flags` to 256 (the has-is-remote bit) and sends ints up to the full int64 range. It defaults to protobuf over HTTP and honors `OTEL_EXPORTER_OTLP_COMPRESSION=gzip`.
+- The Python API counts span kinds from INTERNAL = 0; OTLP from UNSPECIFIED = 0 (so +1). JS ids, times and ints match the JSON exporter's form: ids hex, times decimal strings, ints numbers (beyond 2^53 burnlint writes decimal strings).
+- gRPC (port 4317) is not served; agents that default to it need `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`.
 - The newest lines of the OTel JS packages have conflicting peer ranges on `@opentelemetry/api`; install the pinned set from `scripts/gen-record-fixture.mjs`.
 
 Vercel AI SDK 7.0.157 + @ai-sdk/otel 1.0.157 + @ai-sdk/anthropic 4.0.92, Claude Sonnet 5.5, captured through `record` (fixtures/ai-sdk-v7-*.jsonl):
@@ -78,7 +84,7 @@ NOTES.md holds the dated log of captures, checks and decisions; keep this sectio
 Order set by Alper on 2026-11-14, after the independent progress review: the biggest risk is that nobody outside has used burnlint, so publish first, then widen what it reads, then outcomes. New rules wait until a real user's trace shows money there.
 
 Done:
-- `burnlint record` (OTLP/HTTP JSON; traces only, logs and metrics acknowledged and dropped; protobuf refused with 415 and a hint to set `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`). Checked only against the OTel JS exporter so far.
+- `burnlint record` (OTLP/HTTP, JSON or protobuf, gzip or not; traces only, logs and metrics acknowledged and dropped). Protobuf (2026-11-14): hand-written decoder, checked against the OTel JS protobuf exporter (equals the JSON exporter's output for the same spans) and the Python one (equals the SDK's in-memory spans); recorded either way, the same trace audits the same. gRPC not served.
 - Cost per run (`perRun` in `audit.ts`): count, mean, median, p90 and max cost per run, avoidable per run and as a share of spend; `--runs-per-month` projects both to a month. A run here is the unit of work: a Claude Code session with its sub-agents (grouped by `session`), or one OTLP trace.
 - Real captures, Vercel AI SDK 7 on Claude Sonnet 5.5 (both span formats; bench in `bench/ai-sdk/`, Alper runs it on his key, about $12 so far): cost and savable match independent checks on every captured run, and each rule fires on its wasteful variant and stays silent on normal runs.
 - `burnlint diff <base> <head>` v1 (2026-11-13/14). Runs compared within groups (`Run.labels`: OTLP root-span scalar attributes, never content keys, plus `gen_ai.agent.name`, filled from `ai.telemetry.functionId`; Claude Code `project`), overall at base's mix, stratified permutation test, `--fail-above` fails only on a clear rise, unpriced calls make it `can't tell`. Checked: +38% on a wasteful variant matches an independent recomputation; A/A on a pinned bench gives -0.9%, p=0.81; over all 8,000 3v3 splits of 18 same-setup runs the gate fires 0.09% at 10%. Inputs must be pinned on both sides (the bench reads a fixed commit, `--snapshot`).
@@ -86,9 +92,8 @@ Done:
 - Published `burnlint@0.1.0` to npm (2026-11-14, tag `v0.1.0`, 4858f1e). Alper runs `npm publish --auth-type=web` in his own terminal (security-key 2FA; a non-interactive shell gets EOTP). npm stages a first publish (`0.0.0-stage` placeholder, then the real version). Before each publish: `npm publish --dry-run`, a tarball install, and compare the published `dist.shasum` with a local `npm pack`.
 
 Next, in order:
-1. Protobuf in `record`: a hand-written decoder for the trace messages, no dependency.
-2. A second builder framework, from a real capture: OpenAI Agents SDK, or LangGraph via OpenInference.
-3. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
+1. A second builder framework, from a real capture: OpenAI Agents SDK, or LangGraph via OpenInference.
+2. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
 
 Later, unordered:
 - `diff`: findings added/removed; Markdown output; a GitHub Action; let the user allow label keys the content filter drops (`bench.input_id`, `bench.context`; Alper, 2026-11-14).

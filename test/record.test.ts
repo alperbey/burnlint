@@ -101,22 +101,6 @@ test("the trace file is private to the user", { skip: process.platform === "win3
   assert.equal(statSync(file).mode & 0o777, 0o600);
 });
 
-test("protobuf trace exports are refused with 415 and a hint, nothing is written", async () => {
-  const file = outFile();
-  await withRecorder(file, async (r, url) => {
-    const res = await post(`${url}/v1/traces`, new Uint8Array([0x0a, 0x00]), { "content-type": "application/x-protobuf" });
-    assert.equal(res.status, 415);
-    assert.equal(res.headers.get("content-type"), "application/x-protobuf");
-    // google.rpc.Status: field 2 (message), length-delimited.
-    const body = Buffer.from(await res.arrayBuffer());
-    assert.equal(body[0], 0x12);
-    assert.equal(body[1], body.length - 2);
-    assert.match(body.subarray(2).toString("utf8"), /OTEL_EXPORTER_OTLP_PROTOCOL=http\/json/);
-    assert.equal(r.stats.protobufRefused, 1);
-  });
-  assert.equal(existsSync(file), false);
-});
-
 test("log and metric exports are acknowledged and dropped", async () => {
   const file = outFile();
   await withRecorder(file, async (r, url) => {

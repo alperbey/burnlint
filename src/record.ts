@@ -3,12 +3,13 @@
 // reads.
 //
 // - Loopback only. Nothing is forwarded anywhere.
-// - JSON encoding only. Protobuf trace exports are refused with 415 so the
-//   sending SDK reports the failure instead of losing spans silently.
+// - JSON and protobuf encodings (OTLP/HTTP). gRPC is not served.
 // - Only traces are kept. Log and metric exports are acknowledged and
 //   dropped, so an agent that exports all three signals doesn't log errors.
-// - Request bodies are written as received (minus line breaks), not
+// - JSON request bodies are written as received (minus line breaks), not
 //   re-serialized, so 64-bit values sent as JSON numbers keep their digits.
+//   Protobuf bodies are decoded (otlp-protobuf.ts) and written as OTLP/JSON,
+//   so the file reads the same whichever encoding the agent used.
 
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -16,6 +17,7 @@ import type { AddressInfo } from "node:net";
 import { dirname } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { looksLikeOtlp } from "./adapters/otlp.js";
+import { decodeTraceRequest, ProtobufError } from "./otlp-protobuf.js";
 
 export const DEFAULT_PORT = 4318;
 const HOST = "127.0.0.1";
@@ -42,9 +44,9 @@ export interface RecordStats {
   /** Trace exports written to the file. */
   requests: number;
   spans: number;
-  /** Trace exports refused because they were protobuf-encoded. */
-  protobufRefused: number;
-  /** Trace exports refused as unreadable (bad JSON, bad encoding, too large). */
+  /** Of `requests`, how many arrived protobuf-encoded. */
+  protobuf: number;
+  /** Trace exports refused as unreadable (bad JSON or protobuf, bad encoding, too large). */
   invalid: number;
   /** Log and metric exports acknowledged and dropped. */
   logsDropped: number;
@@ -182,8 +184,25 @@ function send(res: ServerResponse, status: number, protobuf: boolean, message?: 
   res.end(body);
 }
 
-export const PROTOBUF_HINT =
-  "burnlint record reads OTLP/JSON only; set OTEL_EXPORTER_OTLP_PROTOCOL=http/json on the agent";
+/** OTLP/HTTP content types for each encoding. Both need a CORS preflight, so a web page can't send them. */
+const JSON_TYPE = /^application\/json\s*(;|$)/;
+const PROTOBUF_TYPE = /^application\/(x-)?protobuf\s*(;|$)/;
+
+/** One export as the line to append, and its span count. */
+function exportLine(body: Buffer, protobuf: boolean): { line: string; spans: number } {
+  if (protobuf) {
+    try {
+      const { request, spans } = decodeTraceRequest(body);
+      return { line: JSON.stringify(request), spans };
+    } catch (e) {
+      if (e instanceof ProtobufError) throw new HttpError(400, `request body is not a valid protobuf trace export: ${e.message}`);
+      throw e;
+    }
+  }
+  const text = body.toString("utf8");
+  // Line breaks in valid JSON are only ever whitespace between tokens.
+  return { line: text.replace(/[\r\n]+/g, ""), spans: countSpans(text) };
+}
 
 export async function startRecorder(opts: RecordOptions): Promise<Recorder> {
   const { file, verbose = false } = opts;
@@ -193,7 +212,7 @@ export async function startRecorder(opts: RecordOptions): Promise<Recorder> {
   const stats: RecordStats = {
     requests: 0,
     spans: 0,
-    protobufRefused: 0,
+    protobuf: 0,
     invalid: 0,
     logsDropped: 0,
     metricsDropped: 0,
@@ -220,41 +239,33 @@ export async function startRecorder(opts: RecordOptions): Promise<Recorder> {
       return;
     }
 
-    if (protobuf) {
-      req.resume();
-      if (stats.protobufRefused++ === 0) log(`refused a protobuf trace export: ${PROTOBUF_HINT}`);
-      send(res, 415, true, PROTOBUF_HINT);
-      return;
-    }
-
     try {
-      // Also keeps web pages out: a cross-origin form or no-cors POST can't send this type.
-      if (!/^application\/json\s*(;|$)/.test(contentType)) {
+      // Also keeps web pages out: a cross-origin form or no-cors POST can't send these types.
+      if (!(protobuf ? PROTOBUF_TYPE : JSON_TYPE).test(contentType)) {
         req.resume();
-        throw new HttpError(415, "content-type must be application/json");
+        throw new HttpError(415, "content-type must be application/json or application/x-protobuf");
       }
       const raw = await readBody(req);
-      const text = decodeBody(raw, String(req.headers["content-encoding"] ?? "").toLowerCase()).toString("utf8");
-      const spans = countSpans(text);
+      const body = decodeBody(raw, String(req.headers["content-encoding"] ?? "").toLowerCase());
+      const { line, spans } = exportLine(body, protobuf);
       if (spans > 0) {
-        // Line breaks in valid JSON are only ever whitespace between tokens.
-        const line = text.replace(/[\r\n]+/g, "");
         appendFileSync(file, (needsNewline ? "\n" : "") + line + "\n", { mode: 0o600 });
         needsNewline = false;
         if (stats.spans === 0) log(`receiving spans, writing to ${file}`);
         stats.requests++;
         stats.spans += spans;
+        if (protobuf) stats.protobuf++;
       }
-      if (verbose) log(`${spans} span(s)`);
-      send(res, 200, false);
+      if (verbose) log(`${spans} span(s)${protobuf ? " (protobuf)" : ""}`);
+      send(res, 200, protobuf);
     } catch (e) {
       if (e instanceof HttpError) {
         stats.invalid++;
         if (verbose) log(`refused a trace export: ${e.message}`);
-        send(res, e.status, false, e.message);
+        send(res, e.status, protobuf, e.message);
       } else {
         log(`failed to record a trace export: ${(e as Error).message}`);
-        send(res, 500, false, "burnlint record could not write the trace file");
+        send(res, 500, protobuf, "burnlint record could not write the trace file");
       }
     }
   };

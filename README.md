@@ -98,15 +98,15 @@ In another terminal, run the agent with its OpenTelemetry export pointed at the 
 
 ```
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
-OTEL_EXPORTER_OTLP_PROTOCOL=http/json \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
   your-agent ...
 ```
 
 Stop the recorder with Ctrl-C, then `burnlint audit run.jsonl`.
 
-- **JSON encoding only for now.** Many SDKs and CLIs export protobuf unless told otherwise, hence `OTEL_EXPORTER_OTLP_PROTOCOL=http/json`. A protobuf export is refused with HTTP 415 and counted in the summary; nothing is dropped silently. Gzip-compressed JSON is accepted.
+- **OTLP/HTTP, protobuf or JSON**, gzip-compressed or not. gRPC is not supported: an agent that defaults to it (many Python setups do) needs `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` or `http/json`. The protobuf decoder is part of burnlint (no dependency), checked against the OpenTelemetry JS exporters: a protobuf export decodes to what the JSON exporter sends for the same spans. An export that can't be read is refused with an error the agent's SDK reports, and counted in the summary; nothing is dropped silently.
 - It listens on `127.0.0.1` only (port 4318, change with `--port`) and forwards nothing.
-- Each trace export becomes one line of the output file, written as received. Recording to an existing trace file appends to it.
+- Each trace export becomes one line of the output file: JSON as received, protobuf converted to the same OTLP/JSON form. Recording to an existing trace file appends to it.
 - The file holds whatever the agent exports. With content capture turned on in the agent that includes prompts and tool results, so it is created readable by your user only (mode 0600). burnlint never prints that content.
 - Only traces are kept. Log and metric exports are accepted and discarded, and the summary says how many.
 - The agent still has to have telemetry switched on. How to do that differs per agent and is not something `record` can do for it.
@@ -190,13 +190,12 @@ Checked against AI SDK 7.0.157 with `@ai-sdk/otel` 1.0.157, on real captures (`f
 
 ## Status
 
-v0.1. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP JSON.
+v0.1. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP (protobuf or JSON).
 
 While the version is 0.x, the fields of `-f json` output may change between minor versions; changes are noted in the release notes.
 
 Next:
 
-- Protobuf in `burnlint record`, so agents that cannot switch to `http/json` can be recorded too
 - Dialect mappers checked against real exports: OpenAI Agents SDK, LangGraph and OpenInference first, then Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans
 - Outcomes (pass/fail per run), so `diff` can report cost per successful run; then a GitHub Action
 - More rules (`oversized-tool-result`, `retry-loop`, `context-growth`) once real traces show money there

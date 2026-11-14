@@ -6,7 +6,7 @@ import { audit, severityRank } from "./audit.js";
 import { diff, gate, GroupKeyError, type DiffResult } from "./diff.js";
 import type { Severity } from "./model.js";
 import { PriceTable, type Price } from "./pricing.js";
-import { DEFAULT_PORT, PROTOBUF_HINT, defaultRecordFile, startRecorder } from "./record.js";
+import { DEFAULT_PORT, defaultRecordFile, startRecorder } from "./record.js";
 import { renderDiffJson, renderDiffTable, renderJson, renderMarkdown, renderTable, verdictLine } from "./report.js";
 import { defaultConfig, rules } from "./rules/index.js";
 import { plainText } from "./text.js";
@@ -54,9 +54,10 @@ Diff:
       --prices <file.json>       Price overrides, as for audit
 
 Record:
-  Listens on 127.0.0.1 for OTLP/HTTP with JSON encoding and appends each trace export to a
+  Listens on 127.0.0.1 for OTLP/HTTP (protobuf or JSON) and appends each trace export to a
   JSONL file. Start it, run the agent with OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
-  and OTEL_EXPORTER_OTLP_PROTOCOL=http/json, stop it with Ctrl-C, then audit the file.
+  (and OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf if it defaults to gRPC), stop it with
+  Ctrl-C, then audit the file.
 
   -o, --out <file.jsonl>         File to append to (default: ./burnlint-<UTC time>.jsonl)
       --port <n>                 Port to listen on (default ${DEFAULT_PORT}, 0 = any free port)
@@ -118,10 +119,10 @@ async function record(values: { out?: string; port?: string; verbose: boolean })
 
   const recorder = await startRecorder({ file, port, verbose: values.verbose, log: err });
   const endpoint = `http://127.0.0.1:${recorder.port}`;
-  err(`burnlint record: listening on ${endpoint} (OTLP/HTTP, JSON), traces go to ${file}`);
+  err(`burnlint record: listening on ${endpoint} (OTLP/HTTP, protobuf or JSON), traces go to ${file}`);
   err(`Run the agent with:`);
   err(`  OTEL_EXPORTER_OTLP_ENDPOINT=${endpoint}`);
-  err(`  OTEL_EXPORTER_OTLP_PROTOCOL=http/json`);
+  err(`  OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf   (gRPC is not supported)`);
   err(`Ctrl-C to stop.`);
 
   await new Promise<void>((resolve) => {
@@ -133,12 +134,12 @@ async function record(values: { out?: string; port?: string; verbose: boolean })
   const s = recorder.stats;
   err("");
   if (s.spans) {
-    err(`recorded ${s.spans} span(s) from ${s.requests} export(s) to ${file}`);
+    const enc = s.protobuf === s.requests ? ", protobuf" : s.protobuf ? `, ${s.protobuf} of them protobuf` : "";
+    err(`recorded ${s.spans} span(s) from ${s.requests} export(s)${enc} to ${file}`);
     err(`next: burnlint audit ${file}`);
   } else {
     err(`no spans received, nothing written`);
   }
-  if (s.protobufRefused) err(`${s.protobufRefused} protobuf trace export(s) refused: ${PROTOBUF_HINT}`);
   if (s.invalid) err(`${s.invalid} trace export(s) refused as unreadable (rerun with -v for the reason)`);
   if (s.logsDropped || s.metricsDropped)
     err(`${s.logsDropped} log and ${s.metricsDropped} metric export(s) ignored: only traces are recorded`);
