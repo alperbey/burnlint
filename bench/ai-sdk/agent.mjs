@@ -53,6 +53,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { connect } from "node:net";
 import { parseArgs } from "node:util";
 import { trace, diag, DiagLogLevel } from "@opentelemetry/api";
 import { NodeTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-node";
@@ -411,6 +412,20 @@ async function runOnce(model, task, variant, rep, batch, tracer) {
   );
 }
 
+function receiverUp(u) {
+  const port = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+  return new Promise((resolve, reject) => {
+    const sock = connect({ host: u.hostname, port, timeout: 2000 });
+    const fail = () => {
+      sock.destroy();
+      reject(new Error(`no trace receiver at ${u.host}; start it first, at the repo root: node dist/cli.js record -o captures/<name>.jsonl`));
+    };
+    sock.once("connect", () => (sock.end(), resolve()));
+    sock.once("error", fail);
+    sock.once("timeout", fail);
+  });
+}
+
 async function main() {
   const tasks = opt.tasks.split(",");
   const variants = opt.variants.split(",");
@@ -420,6 +435,8 @@ async function main() {
 
   diag.setLogger({ error: console.error, warn: console.error, info() {}, debug() {}, verbose() {} }, DiagLogLevel.WARN);
   const url = process.env.OTEL_EXPORTER_OTLP_ENDPOINT ? undefined : "http://127.0.0.1:4318/v1/traces";
+  // A run without a receiver is paid for and leaves no trace: check before spending.
+  if (!opt.mock) await receiverUp(new URL(url ?? process.env.OTEL_EXPORTER_OTLP_ENDPOINT));
   const provider = new NodeTracerProvider({
     // Scripted runs are named apart, so they can't pass for real ones in a shared capture.
     resource: resourceFromAttributes({ "service.name": opt.mock ? "burnlint-bench-reviewer-MOCK" : "burnlint-bench-reviewer" }),
