@@ -24,21 +24,22 @@ const NEAR_PASS = ["Pass", "PASS", "passed", "Passed", "passes", "passing", "suc
 
 /**
  * One form per id: hex trace ids and UUIDs (Claude Code sessions) in lowercase,
- * base64 trace ids as hex. Anything else is matched exactly.
+ * base64 trace ids as hex (standard or URL-safe, padded or not). Anything else
+ * is matched exactly.
  */
 export function normalizeRunId(id: string): string {
   const s = id.trim();
   if (/^[0-9a-f]{32}$/i.test(s)) return s.toLowerCase();
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return s.toLowerCase();
-  // 16 bytes in base64: 22 characters and "==".
-  if (/^[A-Za-z0-9+/]{22}==$/.test(s)) return hexId(s);
+  // 16 bytes in base64: 22 characters, then "==" unless the padding was left off.
+  if (/^[A-Za-z0-9+/_-]{22}(==)?$/.test(s)) return hexId(s);
   return s;
 }
 
 export function readOutcomes(file: string): Outcomes {
   let text: string;
   try {
-    text = readFileSync(file, "utf8");
+    text = readFileSync(file, "utf8").replace(/^\uFEFF/, "");
   } catch (e) {
     throw new OutcomesError(`--outcomes ${file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
   }

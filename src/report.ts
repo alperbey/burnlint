@@ -474,7 +474,16 @@ function diffNotes(r: DiffResult): string[] {
   const unpriced = [...new Set([...b.unpricedModels, ...h.unpricedModels])];
   if (unpriced.length) out.push(`no price for model(s): ${unpriced.join(", ")} (add them with --prices)`);
   if (r.success?.unmatchedRows) out.push(`${plural(r.success.unmatchedRows, "row")} in ${short(r.success.file)} name no run on either side`);
-  if (r.onlyBase.length) out.push(`only in base, not compared: ${r.onlyBase.join(", ")}`);
-  if (r.onlyHead.length) out.push(`only in head, not compared: ${r.onlyHead.join(", ")}`);
+  // A group with runs on both sides but no priced run on one is left out of
+  // cost, not of success: say where its passes went.
+  const inSuccess = new Map((r.success?.groups ?? []).map((g) => [g.name, g]));
+  for (const [side, other, names] of [["base", "head", r.onlyBase], ["head", "base", r.onlyHead]] as const) {
+    const alone = names.filter((n) => !inSuccess.has(n));
+    if (alone.length) out.push(`only in ${side}, not compared: ${alone.join(", ")}`);
+    for (const n of names.filter((n) => inSuccess.has(n))) {
+      const g = inSuccess.get(n)!;
+      out.push(`${n}: no priced run in ${other}, so cost leaves it out; success compares it: passed ${passedCell(g.base)} → ${passedCell(g.head)}`);
+    }
+  }
   return out;
 }

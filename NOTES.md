@@ -70,6 +70,14 @@ Deferred to 0.3.1 (CLAUDE.md roadmap): run id merging on a shared 12-hex prefix,
 
 Published `burnlint@0.3.0` (Alper, `npm publish --auth-type=web`, 2026-11-15) from 71c6520: registry `dist.shasum` 2e566e99695a9c4ffbc360bfbd77236fc9029724 equals the local `npm pack`; `latest` = 0.3.0; a fresh install from the registry runs `audit --outcomes` on the fixtures. Tag `v0.3.0`.
 
+## 0.3.1 (2026-11-15)
+
+The four items deferred from the 0.3.0 review, each with a test that fails on 0.3.0:
+- Run ids: `file#` + 12 hex of the trace id, unless another trace in the file shares those 12 hex; then both get the whole trace id. Normal output is unchanged. Display labels still show 8 characters, so such runs look alike in the table but are counted apart.
+- `diff` no longer returns 2 before the gates when a side has no priced run or no group has priced runs on both sides: that adds exit 2 ("cost per run not compared" with outcomes, "nothing to compare" without), and the success gate still runs, so a head whose runs all failed before a priced call exits 1 on a clear drop.
+- A group with runs on both sides but no priced run on one was listed as "only in base, not compared" although success compares it; now named with its passes ("b: no priced run in head, so cost leaves it out; success compares it: passed 3/3 → 0/3").
+- Outcomes files: base64 run ids unpadded or URL-safe (22 characters) are decoded like padded ones; a leading UTF-8 BOM is skipped.
+
 ## DeepSeek and Gemini on the AI SDK bench (2026-11-15)
 
 `bench/ai-sdk/agent.mjs --provider google|deepseek` (pinned `@ai-sdk/google` 4.0.108, `@ai-sdk/deepseek` 3.0.76; defaults gemini-3.8-flash and deepseek-flash, reasoning at medium / DeepSeek "high"; budget guard priced from `prices.json`; each run saves the provider's raw usage summed over steps as `rawUsage`; `nocache` is Anthropic-only).
