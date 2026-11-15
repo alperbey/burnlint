@@ -52,15 +52,17 @@ Diff:
       --fail-above <pct>         Exit 1 if cost per run rose more than this many percent and the
                                  runs show a rise clearly (one-sided p < 0.05). A rise the runs
                                  can't tell from noise passes. Inputs must be the same on both
-                                 sides: a task that reads a growing repo costs more by itself. With 3 runs per group, only rises
-                                 of 15-20% or more are reliably seen; use 5+ runs for 10%.
+                                 sides: a task that reads a growing repo costs more by itself.
+                                 With 3 runs per group, only rises of 15-20% or more are reliably
+                                 seen; use 5+ runs for 10%.
       --outcomes <file.jsonl>    Pass/fail per run, as for audit: adds success before and after,
                                  tested like cost, and cost per successful run
       --fail-success-drop <pts>  Exit 1 if the success rate fell more than this many percentage
                                  points and the runs show a drop clearly (one-sided p < 0.05).
-                                 Few runs can only show a collapse: 3 runs per group never show
-                                 a drop; 5 per group show 5/5 -> 1/5. Grouping by input (a label
-                                 per input, --group-by) makes each input count on its own.
+                                 Few runs can only show a collapse: one group of 3 runs never
+                                 shows a drop, one of 5 shows 5/5 -> 1/5; groups add up (2 x 3
+                                 runs show 6/6 -> 1/6). Grouping by input (a label per input,
+                                 --group-by) makes each input count on its own.
   -f, --format <table|json>      Output format (default: table)
       --prices <file.json>       Price overrides, as for audit
 

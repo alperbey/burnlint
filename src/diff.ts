@@ -47,6 +47,7 @@ export interface SuccessDiff {
   file: string;
   /** Rows naming no run on either side. */
   unmatchedRows: number;
+  /** Over the compared groups only, like the rates. */
   base: SuccessCounts;
   head: SuccessCounts;
   /** Groups with runs on both sides, in base order. */
@@ -423,15 +424,18 @@ function success(base: Unit[], head: Unit[], o: Outcomes, test: DiffTest = "two-
     : [];
   const t = samples.length ? overall(samples, unknown, test) : null;
   const flip: Record<Verdict, Verdict> = { higher: "lower", lower: "higher", "no clear change": "no clear change", "too few runs": "too few runs", "can't tell": "can't tell" };
-  const change = baseRate != null && headRate != null ? headRate - baseRate : null;
+  // Equal rates summed in another order can differ in the last bits: that is no change.
+  const diff = baseRate != null && headRate != null ? headRate - baseRate : null;
+  const change = diff !== null && Math.abs(diff) < 1e-12 ? 0 : diff;
   let verdict: Verdict = t ? flip[t.verdict] : "can't tell";
   // Nothing moved: don't call that "too few runs".
   if (change === 0 && verdict === "too few runs") verdict = "no clear change";
   return {
     file: o.file,
     unmatchedRows: [...o.rows.keys()].filter((id) => !ids.has(id)).length,
-    base: counts(base),
-    head: counts(head),
+    // The same runs the rates cover: groups on both sides.
+    base: counts(base.filter((u) => names.includes(u.group))),
+    head: counts(head.filter((u) => names.includes(u.group))),
     groups,
     baseRate,
     headRate,
@@ -558,8 +562,8 @@ export function gate(r: DiffResult, failAbovePct: number): "fail" | "pass" | "un
 /**
  * The success gate: fail when success fell more than `points` percentage
  * points and the runs show a drop clearly (one-sided p < 0.05). "too few runs"
- * when no drop these runs could show would be clear: passing, with a warning,
- * since 3 runs a group can never show one.
+ * when no drop these runs could show would be clear: passing, with a warning
+ * (a single group of 3 runs can never show one).
  */
 export function successGate(r: DiffResult, points: number): "fail" | "pass" | "unclear" | "too few runs" | "can't tell" {
   const s = r.success;

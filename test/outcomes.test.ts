@@ -56,7 +56,9 @@ test("outcomes file: bad lines are refused with their line number, never their v
   refuse(`{"run": "a", "Pass": true}`, /found "Pass"/);
   refuse(`{"run": "a", "score": 1}`, /line 1: no "pass"$/);
   for (const v of [`"true"`, `1`, `null`]) refuse(`{"run": "a", "pass": ${v}}`, /line 1: "pass" must be true or false/);
-  refuse(`${ok}\n\n{"run": "${EXPLAIN[0]!.toUpperCase()}", "pass": false}`, new RegExp(`line 3: run ${EXPLAIN[0]} is listed as both pass and fail \\(also on line 1\\)`));
+  refuse(`${ok}\n\n{"run": "${EXPLAIN[0]!.toUpperCase()}", "pass": false}`, /line 3: this run is listed as both pass and fail \(also on line 1\)$/);
+  // The run id is a value from the user's file: never echoed.
+  refuse(`{"run": "SECRET", "pass": true}\n{"run": "SECRET", "pass": false}`, /line 2: this run is listed as both pass and fail \(also on line 1\)$/);
   refuse(`\n\n`, /no outcomes in the file/);
   // The same outcome twice is fine (files get concatenated).
   assert.equal(readOutcomes(tmpFile("o.jsonl", `${ok}\n${ok}\n`)).rows.size, 1);
@@ -227,7 +229,89 @@ test("diff: without outcomes nothing about success is shown", () => {
   assert.doesNotMatch(renderDiffTable(r, { width: 200 }), /success|passed/);
 });
 
+test("diff: groups add up, 2 tasks x 3 runs show 6/6 -> 1/6 (one-sided p = 1/20 x 1/5)", () => {
+  const r = diffOf([...passes("a", true, true, true), ...passes("b", true, true, true)], [...passes("a", false, false, false), ...passes("b", true, false, false)], "rise");
+  close(r.success!.pDrop, 1 / 100);
+  assert.equal(r.success!.verdict, "lower");
+  assert.equal(successGate(r, 10), "fail");
+});
+
+test("diff: by input, the two-sided verdict needs six flips where the gate needs five", () => {
+  const flips = (n: number) => {
+    const inputs = Array.from({ length: n }, (_, i) => `i${i}`);
+    return diffOf(inputs.map((i) => unit(i, true)), inputs.map((i) => unit(i, false)));
+  };
+  assert.equal(flips(5).success!.verdict, "too few runs");
+  close(flips(6).success!.pTwoSided, 2 / 64);
+  assert.equal(flips(6).success!.verdict, "lower");
+});
+
+test("diff: the pass counts cover the same groups as the rates", () => {
+  // Task b is only in base: not compared, so not in the counts either.
+  const r = diffOf([...passes("a", true, true, true, true, true), ...passes("b", false, false, false, false, false)], passes("a", true, true, true, true, false));
+  const s = r.success!;
+  close(s.baseRate!, 1);
+  close(s.headRate!, 0.8);
+  assert.deepEqual(s.base, { runs: 5, known: 5, passed: 5 });
+  assert.deepEqual(s.head, { runs: 5, known: 5, passed: 4 });
+  assert.match(renderDiffTable(r, { width: 200 }), /passed 5\/5 → 4\/5/);
+});
+
+test("diff: equal rates summed in another order are no change, not a drop of -0.0 points", () => {
+  // Per task 3,2,1 passes of 3 -> 2,2,2: 6/9 both sides; the weighted sums differ in the last bits.
+  const r = diffOf(
+    [...passes("a", true, true, true), ...passes("b", true, true, false), ...passes("c", true, false, false)],
+    [...passes("a", true, true, false), ...passes("b", true, true, false), ...passes("c", true, true, false)],
+    "rise",
+  );
+  assert.equal(r.success!.change, 0);
+  assert.equal(successVerdictLine(r), "no change");
+  assert.equal(successGate(r, 0), "pass");
+});
+
 // --- CLI -----------------------------------------------------------------------
+
+// One OTLP trace per input, each a single priced call; head and base share inputs.
+const inputsFile = (side: "a" | "b", costs: number[]) => {
+  const spans = costs.map((c, i) =>
+    span({
+      id: "1",
+      name: "chat",
+      start: 0,
+      trace: `${side}${i + 1}`.padEnd(32, "0"),
+      attrs: {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": "anthropic",
+        "gen_ai.request.model": "claude-sonnet-5-5",
+        "gen_ai.usage.input_tokens": c,
+        "gen_ai.usage.output_tokens": 1,
+        "bench.input_id": `q${i + 1}`,
+      },
+    }),
+  );
+  return tmpFile(`${side}.json`, JSON.stringify(otlp(spans)));
+};
+const traceIds = (side: "a" | "b", n: number) => Array.from({ length: n }, (_, i) => `${side}${i + 1}`.padEnd(32, "0"));
+
+test("cli: --fail-success-drop exits 1 on a clear drop; with both gates, a failure (1) wins over can't tell (2)", () => {
+  const base = inputsFile("a", [1000, 1000, 1000, 1000, 1000]);
+  const head = inputsFile("b", [2000, 2000, 2000, 2000, 2000]);
+  const rows = (headPass: boolean, skipLast = false) =>
+    tmpFile("o.jsonl", jsonl([...traceIds("a", 5).map((run) => ({ run, pass: true })), ...traceIds("b", skipLast ? 4 : 5).map((run) => ({ run, pass: headPass }))]));
+  const by = ["--group-by", "bench.input_id"];
+
+  const fell = run("diff", base, head, ...by, "--outcomes", rows(false), "--fail-success-drop", "10");
+  assert.equal(fell.status, 1, fell.stderr);
+  assert.match(fell.stderr, /success fell 100\.0 points \(5\/5 -> 0\/5 passed\), more than 10 points/);
+
+  // Success can't tell (one head run has no outcome) but cost clearly rose: exit 1.
+  const both = run("diff", base, head, ...by, "--outcomes", rows(true, true), "--fail-success-drop", "10", "--fail-above", "10");
+  assert.equal(both.status, 1, both.stderr);
+  // Without the cost gate, can't tell alone exits 2.
+  const cant = run("diff", base, head, ...by, "--outcomes", rows(true, true), "--fail-success-drop", "10");
+  assert.equal(cant.status, 2, cant.stderr);
+});
+
 
 test("cli: --outcomes on audit; a file naming no run here exits 2; a bad file exits 2 with its line", () => {
   const ok = run("audit", fixture("openai-agents-explain.jsonl"), "--outcomes", fixture("openai-agents-outcomes.jsonl"));

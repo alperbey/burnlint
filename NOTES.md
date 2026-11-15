@@ -58,6 +58,16 @@ Scope (Alper): burnlint doesn't evaluate output; the user's tests or evals suppl
 
 Checked on `captures/agents-2.jsonl` with an outcomes file built from the bench's grades (22 runs with an outcome, 17 passed): cost per successful run $0.085161 from burnlint, $0.08515 from the bench's own usage (`usd` rounded to 4 decimals per run). `diff` normal vs prefix (explain + principle, 3 runs each): cost +34%; success 6/6 -> 5/6, "too few runs to tell", as it should be at 3 runs; cost per success $0.032 -> $0.052, which checks by hand at base's mix. Fixture `openai-agents-outcomes.jsonl`: the bench's grades for the four committed OpenAI Agents SDK traces. The bench changes were run in mock mode (no key): the turn-limit path and the graded path both work; mock runs write no outcome rows.
 
+## 0.3.0 pre-release review (2026-11-15)
+
+Independent review by Fable 5.2 of b723afe..b21e003 (read-only, ran its own inputs). Numbers held: one-sided p equal to the hypergeometric (9/10 -> 4/10: 0.028638), base-mix weighting and cost per success by hand. Fixed before publish, with tests:
+- The pass counts beside the success rates counted every run, the rates only groups on both sides (base a 5/5 + b 0/5, head a 4/5 printed `100% -> 80%` next to `5/10 -> 4/5`). Counts now cover the compared groups.
+- Power claims: "3 runs per group never show a drop" holds for one group only; 2 tasks x 3 runs show 6/6 -> 1/6 (one-sided p = 1/100). By input, the gate needs 5 flips (1/32), the two-sided verdict 6 (2/64). Help, README, CLAUDE.md corrected.
+- The pass-and-fail conflict error echoed the run id from the user's file. Now names line numbers only.
+- Equal rates summed in another order (3,2,1 -> 2,2,2 of 3) gave change -1.1e-16: "head passed less often (6/9 -> 6/9)". A change under 1e-12 is now 0.
+- "on those 1 ÷ 0 passes" now reads "0 of 1 run passed (0.0%) · $0.12 spent on it".
+Deferred to 0.3.1 (CLAUDE.md roadmap): run id merging on a shared 12-hex prefix, the early exit 2 before the success gate, more base64 forms and a BOM.
+
 ## DeepSeek and Gemini on the AI SDK bench (2026-11-15)
 
 `bench/ai-sdk/agent.mjs --provider google|deepseek` (pinned `@ai-sdk/google` 4.0.108, `@ai-sdk/deepseek` 3.0.76; defaults gemini-3.8-flash and deepseek-flash, reasoning at medium / DeepSeek "high"; budget guard priced from `prices.json`; each run saves the provider's raw usage summed over steps as `rawUsage`; `nocache` is Anthropic-only).

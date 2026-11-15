@@ -64,7 +64,7 @@ export function readOutcomes(file: string): Outcomes {
     if (typeof o.pass !== "boolean") throw bad(n, `"pass" must be true or false`);
     const id = normalizeRunId(o.run);
     const seen = rows.get(id);
-    if (seen !== undefined && seen !== o.pass) throw bad(n, `run ${id} is listed as both pass and fail (also on line ${lineOf.get(id)})`);
+    if (seen !== undefined && seen !== o.pass) throw bad(n, `this run is listed as both pass and fail (also on line ${lineOf.get(id)})`);
     rows.set(id, o.pass);
     if (!lineOf.has(id)) lineOf.set(id, n);
   });

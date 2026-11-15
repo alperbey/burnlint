@@ -184,7 +184,7 @@ function totalLines(r: AuditResult): Array<[string, string, string]> {
   const o = r.outcomes;
   if (o) {
     const parts = o.known
-      ? [`${o.passed} of ${plural(o.known, "run")} passed (${pct(o.successRate!)})`, `${usd(o.costUsd)} on those ${o.known} ÷ ${o.passed} passes, failed runs included`]
+      ? [`${o.passed} of ${plural(o.known, "run")} passed (${pct(o.successRate!)})`, o.passed ? `${usd(o.costUsd)} on those ${o.known} ÷ ${o.passed} passes, failed runs included` : `${usd(o.costUsd)} spent on ${o.known === 1 ? "it" : "them"}`]
       : [`no run here has an outcome in ${short(o.file)}`];
     if (o.known && o.known < o.runs) parts.push(`no outcome for ${o.runs - o.known} of ${o.runs}`);
     if (o.incomplete) parts.push(`lower bound: ${plural(o.incomplete, "run")} priced in part`);
