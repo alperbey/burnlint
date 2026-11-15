@@ -21,13 +21,15 @@
 //   cite file:line, every citation must exist, and task-specific facts must
 //   appear. That says the answer is grounded, not that it is right.
 //
-// Checked with: ai 7.0.157, @ai-sdk/anthropic 4.0.92, @ai-sdk/otel 1.0.157,
+// Checked with: ai 7.0.157, @ai-sdk/anthropic 4.0.92, @ai-sdk/google 4.0.108,
+//   @ai-sdk/deepseek 3.0.76 (same @ai-sdk/provider 4.0.34 as ai), @ai-sdk/otel 1.0.157,
 //   @opentelemetry/api 1.9.1, sdk-trace-node 2.12.1, resources 2.12.1,
 //   exporter-trace-otlp-http 0.223.2 (see package.json; npm ci).
 //
 // Usage (from this folder, with `burnlint record` running):
 //   node ../../dist/cli.js record -o ../../captures/ai-sdk-2.jsonl   # terminal 1
 //   ANTHROPIC_API_KEY=... node agent.mjs                              # terminal 2
+//   (--provider google: GOOGLE_GENERATIVE_AI_API_KEY; --provider deepseek: DEEPSEEK_API_KEY)
 // Options:
 //   --tasks review,explain,principle   --variants normal,prefix,nocache,reread
 //   --repeat 3
@@ -35,7 +37,11 @@
 //                                       legacy = LegacyOpenTelemetry, ai.* spans)
 //   --max-steps 15 (answer phase; the check phase gets 8)
 //   --budget 15 (USD, all runs)  --run-cap 1.5 (USD, one run)
-//   --repo ../..    --model claude-sonnet-5-5
+//   --repo ../..
+//   --provider anthropic|google|deepseek  --model (default claude-sonnet-5-5, gemini-3.8-flash,
+//                    deepseek-flash). Reasoning at medium for each (DeepSeek's lowest canonical
+//                    level above "low" is "high"). Google and DeepSeek cache automatically, so
+//                    the nocache variant (Anthropic's explicit cache_control) is Anthropic-only.
 //   --snapshot 4233b57  commit the tools see, checked out into a temporary git
 //                    worktree, so runs on different days see the same code
 //                    ("live" = the working tree as it is; runs before
@@ -44,6 +50,10 @@
 //   --mock          scripted model, no API key, no cost: checks the pipeline only.
 //                   Its traces are not real and must never become a fixture.
 //
+// out/outcomes.jsonl holds pass/fail per run for `burnlint audit|diff --outcomes`: a graded
+// run passes or fails on its grade (a run stopped by its step limit or run cap is graded on the
+// answer it has, usually none, so it fails); a run that threw (provider or network, after the
+// SDK's retries) gets no row: unknown, not failed.
 // Answers and per-run results go to out/ (runs.jsonl: trace id, usage, grade;
 // `batch` tells invocations apart). Traces carry prompts, tool results and
 // answers, as the SDK records them by default; burnlint never prints them.
@@ -68,7 +78,7 @@ const VARIANTS = ["normal", "prefix", "nocache", "reread"];
 const { values: opt } = parseArgs({
   options: {
     tasks: { type: "string", default: "review,explain,principle" },
-    variants: { type: "string", default: VARIANTS.join(",") },
+    variants: { type: "string" },
     repeat: { type: "string", default: "3" },
     telemetry: { type: "string", default: "semconv" },
     "max-steps": { type: "string", default: "15" },
@@ -76,7 +86,8 @@ const { values: opt } = parseArgs({
     "run-cap": { type: "string", default: "1.5" },
     repo: { type: "string", default: "../.." },
     snapshot: { type: "string", default: "4233b57" },
-    model: { type: "string", default: "claude-sonnet-5-5" },
+    provider: { type: "string", default: "anthropic" },
+    model: { type: "string" },
     mock: { type: "boolean", default: false },
     grade: { type: "string" },
   },
@@ -111,9 +122,24 @@ for (const [k, v] of Object.entries({ "max-steps": MAX_STEPS, repeat: REPEAT, bu
   if (!(v > 0)) throw new Error(`--${k} must be a positive number`);
 if (!["semconv", "legacy"].includes(opt.telemetry)) throw new Error("--telemetry must be semconv or legacy");
 
-// Claude Sonnet 5.5, USD per 1M tokens (Anthropic model docs, Nov 2026). Only
-// used for the budget guard; burnlint prices the trace with its own table.
-const PRICE = { input: 2, output: 10, cacheRead: 0.1, cacheWrite5m: 2.5 };
+const PROVIDERS = {
+  anthropic: { model: "claude-sonnet-5-5", key: "ANTHROPIC_API_KEY", maxOutputTokens: 4000 },
+  // Thinking counts against the output limit; at 6000 the OpenAI bench's answers were cut off.
+  google: { model: "gemini-3.8-flash", key: "GOOGLE_GENERATIVE_AI_API_KEY", maxOutputTokens: 16000 },
+  deepseek: { model: "deepseek-flash", key: "DEEPSEEK_API_KEY", maxOutputTokens: 16000 },
+};
+const PROVIDER = PROVIDERS[opt.provider];
+if (!PROVIDER || !Object.hasOwn(PROVIDERS, opt.provider)) throw new Error(`--provider must be one of ${Object.keys(PROVIDERS).join(", ")}`);
+opt.model ??= PROVIDER.model;
+
+// USD per 1M tokens from burnlint's own table (LiteLLM). Only used for the
+// budget guard; burnlint prices the trace itself.
+const PRICE = (() => {
+  const table = JSON.parse(readFileSync(new URL("../../src/pricing/prices.json", import.meta.url), "utf8")).models;
+  const p = table[opt.model];
+  if (!p || p.input == null || p.output == null) throw new Error(`no price for ${opt.model} in src/pricing/prices.json`);
+  return { input: p.input, output: p.output, cacheRead: p.cacheRead ?? p.input, cacheWrite5m: p.cacheWrite5m ?? p.input };
+})();
 
 const REVIEW_COMMIT = "fd08744";
 
@@ -286,13 +312,25 @@ function usdOf(u) {
 }
 const sumUsd = (steps) => steps.reduce((s, st) => s + usdOf(st.usage), 0);
 
+/** Numeric leaves of each step's raw provider usage, summed by dotted key. */
+function sumRaw(steps) {
+  const out = {};
+  const walk = (v, key) => {
+    if (typeof v === "number") out[key] = (out[key] ?? 0) + v;
+    else if (v && typeof v === "object" && !Array.isArray(v)) for (const [k, x] of Object.entries(v)) walk(x, key ? `${key}.${k}` : k);
+  };
+  for (const st of steps) walk(st.usage?.raw, "");
+  return out;
+}
+
 // ---------- model ----------
 
 async function makeModel() {
   if (!opt.mock) {
-    if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is not set (or use --mock)");
-    const { anthropic } = await import("@ai-sdk/anthropic");
-    return anthropic(opt.model);
+    if (!process.env[PROVIDER.key]) throw new Error(`${PROVIDER.key} is not set (or use --mock)`);
+    if (opt.provider === "google") return (await import("@ai-sdk/google")).google(opt.model);
+    if (opt.provider === "deepseek") return (await import("@ai-sdk/deepseek")).deepseek(opt.model);
+    return (await import("@ai-sdk/anthropic")).anthropic(opt.model);
   }
   // Scripted: per phase, list, read, grep, answer. Usage grows like a cached
   // conversation would. Pipeline check only, not a real trace.
@@ -335,19 +373,21 @@ async function runOnce(model, task, variant, rep, batch, tracer) {
     async (span) => {
       const traceId = span.spanContext().traceId;
       const started = Date.now();
-      const record = { batch, traceId, task, variant, rep, telemetry: opt.telemetry, model: opt.model, mock: opt.mock, startedAt: new Date(started).toISOString() };
+      const record = { batch, traceId, task, variant, rep, telemetry: opt.telemetry, provider: opt.provider, model: opt.model, mock: opt.mock, startedAt: new Date(started).toISOString() };
       // The marker opens the system prompt, so no other run shares a cached prefix with this one.
       const system = `Run ${randomUUID().slice(0, 8)}. ${SYSTEM}`;
       const common = {
         model,
         tools,
-        maxOutputTokens: 4000,
+        maxOutputTokens: PROVIDER.maxOutputTokens,
         providerOptions: {
           anthropic: {
             effort: "medium",
             thinking: { type: "between_tools" },
             ...(variant === "nocache" ? {} : { cacheControl: { type: "ephemeral" } }),
           },
+          google: { thinkingConfig: { thinkingLevel: "medium" } },
+          deepseek: { thinking: { type: "enabled" }, reasoningEffort: "high" },
         },
         instructions: system,
         // prefix: the time at the end of the system prompt changes the cached prefix every step.
@@ -389,6 +429,8 @@ async function runOnce(model, task, variant, rep, batch, tracer) {
             output: tot((u) => u.outputTokens),
           },
           usd: Number(usd.toFixed(4)),
+          // The provider's own usage, summed over steps: checks burnlint without trusting the SDK's conversion.
+          rawUsage: sumRaw([...answer.steps, ...check.steps]),
           grade: g,
         });
         writeFileSync(join("out", `${batch}-${label}.md`), text || "(no answer: stopped before a final reply)\n");
@@ -405,6 +447,11 @@ async function runOnce(model, task, variant, rep, batch, tracer) {
         record.usd ??= Number(usd.toFixed(4));
         record.seconds = Math.round((Date.now() - started) / 1000);
         appendFileSync(join("out", "runs.jsonl"), JSON.stringify(record) + "\n");
+        if (record.grade && !opt.mock)
+          appendFileSync(
+            join("out", "outcomes.jsonl"),
+            JSON.stringify({ run: traceId, pass: record.grade.pass, task, variant, batch, telemetry: opt.telemetry, provider: opt.provider, model: opt.model }) + "\n",
+          );
         span.end();
       }
       return { usd, error: record.error };
@@ -428,7 +475,9 @@ function receiverUp(u) {
 
 async function main() {
   const tasks = opt.tasks.split(",");
-  const variants = opt.variants.split(",");
+  // Google and DeepSeek cache on their own: there is no cache_control to leave out.
+  const variants = (opt.variants ?? VARIANTS.filter((v) => opt.provider === "anthropic" || v !== "nocache").join(",")).split(",");
+  if (opt.provider !== "anthropic" && variants.includes("nocache")) throw new Error("the nocache variant is Anthropic-only (explicit cache_control)");
   for (const t of tasks) if (!TASKS[t]) throw new Error(`unknown task ${t}`);
   for (const v of variants) if (!VARIANTS.includes(v)) throw new Error(`unknown variant ${v} (${VARIANTS.join(", ")})`);
   if (!opt.mock && !existsSync(join(REPO, ".git"))) throw new Error(`${REPO} is not a git checkout`);

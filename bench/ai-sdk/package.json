@@ -5,6 +5,8 @@
   "description": "A small Vercel AI SDK agent, run to capture real traces for burnlint. Not part of the published package.",
   "dependencies": {
     "@ai-sdk/anthropic": "4.0.92",
+    "@ai-sdk/deepseek": "3.0.76",
+    "@ai-sdk/google": "4.0.108",
     "@ai-sdk/otel": "1.0.157",
     "@opentelemetry/api": "1.9.1",
     "@opentelemetry/exporter-trace-otlp-http": "0.223.2",
