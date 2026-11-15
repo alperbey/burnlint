@@ -99,7 +99,7 @@ Done:
 
 - Published `burnlint@0.1.0` to npm (2026-11-14, tag `v0.1.0`, 4858f1e). Alper runs `npm publish --auth-type=web` in his own terminal (security-key 2FA; a non-interactive shell gets EOTP). npm stages a first publish (`0.0.0-stage` placeholder, then the real version). Before each publish: `npm publish --dry-run`, a tarball install, and compare the published `dist.shasum` with a local `npm pack`.
 
-- Second builder framework: OpenAI Agents SDK via OpenInference (2026-11-14, bench in `bench/openai-agents/`, about $1.50): tokens and cost equal the SDK's own usage on all 18 checked runs; `reread-unchanged` fires on 6/6 reread runs and on none of 12 others; usage lost to the span attribute limit is reported as such. Reviewed independently (Fable 5.2, 2026-11-15) and fixed; version 0.2.0 (with protobuf), not yet published.
+- Second builder framework: OpenAI Agents SDK via OpenInference (2026-11-14, bench in `bench/openai-agents/`, about $1.50): tokens and cost equal the SDK's own usage on all 18 checked runs; `reread-unchanged` fires on 6/6 reread runs and on none of 12 others; usage lost to the span attribute limit is reported as such. Reviewed independently (Fable 5.2, 2026-11-15) and fixed. Published as `burnlint@0.2.0` (2026-11-15, with protobuf; tag `v0.2.0`, 840346d; `latest`).
 
 Next, in order:
 1. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
