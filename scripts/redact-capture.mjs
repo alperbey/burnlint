@@ -20,7 +20,13 @@
 // "[redacted N chars]" marker: burnlint doesn't read them. The exception
 // message on a failed span is kept.
 //
-// Used for fixtures/ai-sdk-v7-*.jsonl, from captures of bench/ai-sdk/agent.mjs.
+// OpenInference spans (openinference.span.kind): prompts, model output and
+// flattened messages, tool definitions and the request's instructions are
+// redacted; a TOOL span keeps its arguments (input.value) and gets filler for
+// its result (output.value).
+//
+// Used for fixtures/ai-sdk-v7-*.jsonl, from captures of bench/ai-sdk/agent.mjs,
+// and fixtures/openai-agents-*.jsonl, from bench/openai-agents/agent.py.
 
 import { createHmac, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -44,6 +50,29 @@ const DROP_KEYS = new Set([
   "ai.response.toolCalls",
   "ai.response.providerMetadata",
 ]);
+
+// OpenInference: generic keys whose meaning depends on the span kind, and
+// flattened message attributes (llm.input_messages.0.message.content, ...).
+const OI_DROP_PREFIXES = ["llm.input_messages.", "llm.output_messages.", "llm.tools."];
+
+/** "result" | "prompt" | "drop" | undefined (keep) for one attribute of a span. */
+function treatment(key, oiKind) {
+  if (RESULT_KEYS.has(key)) return "result";
+  if (PROMPT_KEYS.has(key)) return "prompt";
+  if (DROP_KEYS.has(key)) return "drop";
+  if (!oiKind) return undefined;
+  // On a TOOL span, input.value is the tool's arguments (kept, like gen_ai tool
+  // arguments) and output.value its result. On any other span they are the
+  // prompt and the model's output.
+  if (key === "output.value") return oiKind === "TOOL" ? "result" : "drop";
+  if (key === "input.value") return oiKind === "TOOL" ? undefined : "drop";
+  // The request's parameters, including `instructions` (the system prompt).
+  if (key === "llm.invocation_parameters") return "params";
+  // The tool's definition (docstring, JSON schema), like gen_ai.tool.definitions.
+  if (key === "tool.description" || key === "tool.parameters") return "drop";
+  if (OI_DROP_PREFIXES.some((p) => key.startsWith(p))) return "drop";
+  return undefined;
+}
 
 const SECRET = randomBytes(32);
 
@@ -93,6 +122,31 @@ function redactResult(v) {
   return encoded ? JSON.stringify(out) : out;
 }
 
+// Request parameters: only settings that shape cost are kept (an allowlist).
+// The rest (instructions, response ids, cache keys, billing, metadata) is
+// dropped with its key. Anything that doesn't parse is dropped whole.
+const PARAM_KEEP = new Set([
+  "model",
+  "reasoning",
+  "max_output_tokens",
+  "max_tokens",
+  "temperature",
+  "top_p",
+  "tool_choice",
+  "parallel_tool_calls",
+  "truncation",
+  "service_tier",
+  "prompt_cache_retention",
+]);
+function redactParams(v) {
+  let p;
+  try {
+    p = JSON.parse(v);
+  } catch {}
+  if (!p || typeof p !== "object" || Array.isArray(p)) return `[redacted ${v.length} chars]`;
+  return JSON.stringify(Object.fromEntries(Object.entries(p).filter(([k]) => PARAM_KEEP.has(k))));
+}
+
 let spans = 0;
 const lines = [];
 for (const line of readFileSync(src, "utf8").split("\n")) {
@@ -108,18 +162,21 @@ for (const line of readFileSync(src, "utf8").split("\n")) {
       ss.spans = (ss.spans ?? []).filter((s) => keep.has(String(s.traceId).toLowerCase()));
       for (const s of ss.spans) {
         spans++;
+        const oiKind = s.attributes?.find((a) => a.key === "openinference.span.kind")?.value?.stringValue;
         for (const a of s.attributes ?? []) {
           // A list of strings (AI SDK legacy `ai.prompt.tools`): dropped keys lose every item.
           const items = a.value?.arrayValue?.values;
-          if (Array.isArray(items) && DROP_KEYS.has(a.key)) {
+          if (Array.isArray(items) && treatment(a.key, oiKind) === "drop") {
             a.value = { arrayValue: { values: items.map((x) => ({ stringValue: `[redacted ${String(x?.stringValue ?? "").length} chars]` })) } };
             continue;
           }
           const v = a.value?.stringValue;
           if (typeof v !== "string") continue;
-          if (RESULT_KEYS.has(a.key)) a.value = { stringValue: redactResult(v) };
-          else if (PROMPT_KEYS.has(a.key)) a.value = { stringValue: redactPrompt(v) };
-          else if (DROP_KEYS.has(a.key)) a.value = { stringValue: `[redacted ${v.length} chars]` };
+          const t = treatment(a.key, oiKind);
+          if (t === "result") a.value = { stringValue: redactResult(v) };
+          else if (t === "prompt") a.value = { stringValue: redactPrompt(v) };
+          else if (t === "drop") a.value = { stringValue: `[redacted ${v.length} chars]` };
+          else if (t === "params") a.value = { stringValue: redactParams(v) };
         }
         // Span events can carry exception stacks with local paths: keep only their names.
         if (s.events) s.events = s.events.map((e) => ({ timeUnixNano: e.timeUnixNano, name: e.name, attributes: [] }));

@@ -282,13 +282,19 @@ export function verdictLine(r: DiffResult): string {
   const o = r.overall;
   if (!o) return "nothing to compare: no group has priced runs on both sides";
   const ch = signedPct(o.change);
+  // A rise under a gate is judged one-sided, like the gate; everything else two-sided.
+  const oneSided = o.test === "rise" && (o.change ?? 0) > 0;
+  const p = oneSided ? `one-sided ${pValue(o.pHigher)}` : pValue(o.pTwoSided);
   switch (o.verdict) {
     case "higher":
-      return `higher, ${ch} (${pValue(o.pTwoSided)})`;
+      return `higher, ${ch} (${p})`;
     case "lower":
-      return `lower, ${ch} (${pValue(o.pTwoSided)})`;
+      return `lower, ${ch} (${p})`;
     case "no clear change":
-      return `no clear change: ${ch} is within run-to-run noise (${pValue(o.pTwoSided)})`;
+      // Near the line, don't call it noise: the runs just can't show it either way.
+      return (oneSided ? o.pHigher : o.pTwoSided) < 0.1
+        ? `no clear change: ${ch}, not clearly beyond run-to-run noise (${p})`
+        : `no clear change: ${ch} is within run-to-run noise (${p})`;
     case "too few runs":
       return (
         `too few runs to tell (${ch}): no difference these runs could show would reach p<${SIGNIFICANCE}` +
@@ -384,8 +390,9 @@ function diffNotes(r: DiffResult): string[] {
   if (b.failed || h.failed) {
     const more = h.failed / Math.max(1, h.runs) > b.failed / Math.max(1, b.runs);
     out.push(
-      `runs with a failed call: base ${b.failed} of ${b.runs}, head ${h.failed} of ${h.runs}` +
-        (more ? `. A failed run usually stops early and costs less, so head may look cheaper than it is` : ""),
+      `runs with a failed call: base ${b.failed} of ${b.runs}, head ${h.failed} of ${h.runs}. ` +
+        `A failed call has no usage in the trace but may still be billed, so those runs' cost is a lower bound` +
+        (more ? `; and a failed run usually stops early, so head may look cheaper than it is` : ""),
     );
   }
   if (b.models.join() !== h.models.join())

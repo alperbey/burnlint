@@ -1,6 +1,6 @@
 {
   "name": "burnlint",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cost per run for AI agents: compare before and after a change, and find the avoidable part. Reads Claude Code logs and OpenTelemetry GenAI traces.",
   "repository": {
     "type": "git",

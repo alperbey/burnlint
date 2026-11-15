@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { audit, type RunSummary } from "../src/audit.js";
 import { compare, gate, GroupKeyError } from "../src/diff.js";
 import { readOtlp } from "../src/adapters/otlp.js";
-import { renderDiffTable } from "../src/report.js";
+import { renderDiffTable, verdictLine } from "../src/report.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const fixture = (name: string) => join(root, "fixtures", name);
@@ -101,7 +101,30 @@ test("failed runs are counted per side and noted when head has more", () => {
   assert.equal(r.head.excluded, 1);
   assert.equal(r.head.counted, 3);
   assert.equal(r.head.unpriced, 0);
-  assert.match(renderDiffTable(r), /base 0 of 3, head 2 of 4\. A failed run usually stops early/);
+  const table = renderDiffTable(r);
+  assert.match(table, /base 0 of 3, head 2 of 4\. A failed call has no usage in the trace but may still be billed/);
+  assert.match(table, /a failed run usually stops early, so head may look cheaper/);
+});
+
+test("under a gate a rise is judged one-sided, so the headline and the gate agree", () => {
+  // 2 groups, 3 v 3 (400 relabelings): one-sided p 0.03, two-sided 0.06, a rise of ~14%.
+  const base = [...group("a", [1.0, 1.1, 0.9]), ...group("b", [2.0, 2.2, 1.8])];
+  const head = [...group("a", [1.1, 1.15, 1.25]), ...group("b", [2.4, 2.0, 2.3])];
+  const two = compare(base, head).overall!;
+  const rise = compare(base, head, { test: "rise" }).overall!;
+  assert.equal(two.pHigher, rise.pHigher);
+  assert.equal(two.pTwoSided, rise.pTwoSided);
+  // Same data, same p-values; only how the verdict reads them differs.
+  assert.ok(rise.pHigher < 0.05 && two.pTwoSided >= 0.05, `${rise.pHigher} ${two.pTwoSided}`);
+  assert.equal(two.verdict, "no clear change");
+  assert.equal(rise.verdict, "higher");
+  assert.equal(gate({ ...compare(base, head, { test: "rise" }) }, 10), "fail");
+  assert.match(verdictLine(compare(base, head, { test: "rise" })), /^higher, \+\d+% \(one-sided p=/);
+  // Without a gate, p just under 0.10 isn't called noise.
+  assert.match(verdictLine(compare(base, head)), /not clearly beyond run-to-run noise \(p=0\.0\d/);
+  // A fall is judged two-sided either way.
+  const fall = compare(head, base, { test: "rise" }).overall!;
+  assert.equal(fall.verdict, "no clear change");
 });
 
 test("groups on one side only are listed, not compared", () => {

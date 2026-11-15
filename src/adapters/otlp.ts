@@ -26,6 +26,20 @@
 // - A failed call is a model span with error status and no usage. Retries
 //   inside the SDK are one span: "Failed after 3 attempts" on a single span.
 // - Tool calls are `ai.toolCall` spans: ai.toolCall.name/.id/.args/.result.
+//
+// OpenInference spans, checked against openinference-instrumentation-openai-agents
+// 2.8.3 (OpenAI Agents SDK 0.24.0, gpt-5.4-mini over the Responses API):
+// - The kind is in `openinference.span.kind`: one model call per LLM span,
+//   one tool call per TOOL span; AGENT and CHAIN spans carry no usage.
+// - llm.token_count.prompt is the whole prompt, cached tokens included; cache
+//   reads in llm.token_count.prompt_details.cache_read (and .cache_write, 0 for
+//   OpenAI), reasoning in llm.token_count.completion_details.reasoning.
+//   Model in llm.model_name, provider in llm.provider or llm.system.
+// - A TOOL span has tool.name, its JSON arguments in input.value and the result
+//   as plain text in output.value. No tool call id.
+// - Each message is a separate attribute, so a long conversation's LLM span
+//   passes the OTel Python SDK's default limit of 128 attributes and the
+//   oldest are dropped, token counts included (droppedAttributesCount > 0).
 
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
@@ -51,6 +65,7 @@ interface OtlpSpan {
   name: string;
   startTimeUnixNano?: string | number;
   attributes?: KeyValue[];
+  droppedAttributesCount?: number;
   status?: { code?: number | string };
 }
 
@@ -71,6 +86,8 @@ interface Span {
   service?: string;
   /** Span status is ERROR. */
   error: boolean;
+  /** Attributes the sender dropped at its attribute limit. */
+  dropped: number;
 }
 
 export function looksLikeOtlp(text: string): boolean {
@@ -133,6 +150,7 @@ export function readOtlp(file: string): Run[] {
             attrs: attrsOf(s.attributes),
             service: typeof res["service.name"] === "string" ? (res["service.name"] as string) : undefined,
             error: s.status?.code === 2 || s.status?.code === "STATUS_CODE_ERROR",
+            dropped: Number(s.droppedAttributesCount ?? 0) || 0,
           });
         }
       }
@@ -161,7 +179,11 @@ const AI_SDK_CALL_OPS = new Set(["ai.generateText.doGenerate", "ai.streamText.do
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 
+const openInferenceKind = (s: Span) => str(s.attrs["openinference.span.kind"]);
+
 function isLlm(s: Span): boolean {
+  const oi = openInferenceKind(s);
+  if (oi) return oi === "LLM";
   if (AI_SDK_CALL_OPS.has(str(s.attrs["ai.operationId"]) ?? "")) return true;
   const op = str(s.attrs["gen_ai.operation.name"]);
   if (op && LLM_OPS.has(op)) return true;
@@ -170,6 +192,8 @@ function isLlm(s: Span): boolean {
 }
 
 function isTool(s: Span): boolean {
+  const oi = openInferenceKind(s);
+  if (oi) return oi === "TOOL";
   return (
     str(s.attrs["gen_ai.operation.name"]) === "execute_tool" ||
     str(s.attrs["gen_ai.tool.name"]) != null ||
@@ -200,14 +224,21 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
   let relabeled = 0;
   let cacheUnknown = 0;
   let noUsage = 0;
+  let lostToLimit = 0;
   let failed = 0;
   const relabels = new Set<string>();
 
   const turns: Turn[] = llm.map((s, index) => {
     const a = s.attrs;
-    const model = str(a["gen_ai.response.model"]) ?? str(a["gen_ai.request.model"]) ?? str(a["ai.model.id"]);
+    const model =
+      str(a["gen_ai.response.model"]) ?? str(a["gen_ai.request.model"]) ?? str(a["ai.model.id"]) ?? str(a["llm.model_name"]);
     const prov = resolveProvider({
-      reported: str(a["gen_ai.provider.name"]) ?? str(a["gen_ai.system"]) ?? str(a["ai.model.provider"]),
+      reported:
+        str(a["gen_ai.provider.name"]) ??
+        str(a["gen_ai.system"]) ??
+        str(a["ai.model.provider"]) ??
+        str(a["llm.provider"]) ??
+        str(a["llm.system"]),
       model,
       host: str(a["server.address"]),
     });
@@ -216,30 +247,42 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
       relabels.add(`${prov.reported} -> ${prov.provider}`);
     }
 
-    const total = num(a["gen_ai.usage.input_tokens"]);
-    const output = num(a["gen_ai.usage.output_tokens"]);
+    const total = num(a["gen_ai.usage.input_tokens"]) ?? num(a["llm.token_count.prompt"]);
+    const output = num(a["gen_ai.usage.output_tokens"]) ?? num(a["llm.token_count.completion"]);
     let tokens: ModelCall["tokens"] = null;
-    if (total != null || output != null) {
+    // At the sender's attribute limit the oldest attributes go first, and
+    // OpenInference writes the output count before the prompt's: a span can keep
+    // one count and lose the other. Priced on what survived, the call would look
+    // cheaper than it was, so it counts as lost unless both are there.
+    const partial = s.dropped > 0 && (total == null || output == null);
+    if ((total != null || output != null) && !partial) {
       const t = emptyTokens();
       const cacheRead =
         num(a["gen_ai.usage.cache_read.input_tokens"]) ??
         num(a["gen_ai.usage.cache_read_input_tokens"]) ??
         num(a["deepseek.prompt_cache_hit_tokens"]) ??
-        num(a["ai.usage.inputTokenDetails.cacheReadTokens"]);
+        num(a["ai.usage.inputTokenDetails.cacheReadTokens"]) ??
+        num(a["llm.token_count.prompt_details.cache_read"]);
       const cacheWrite =
         num(a["gen_ai.usage.cache_creation.input_tokens"]) ??
         num(a["gen_ai.usage.cache_creation_input_tokens"]) ??
-        num(a["ai.usage.inputTokenDetails.cacheWriteTokens"]);
+        num(a["ai.usage.inputTokenDetails.cacheWriteTokens"]) ??
+        num(a["llm.token_count.prompt_details.cache_write"]);
       t.cacheKnown = cacheRead != null || cacheWrite != null;
       t.cacheRead = cacheRead;
       t.cacheWriteOther = cacheWrite;
       t.input = total == null ? null : Math.max(0, total - (cacheRead ?? 0) - (cacheWrite ?? 0));
       t.output = output;
-      t.reasoning = num(a["gen_ai.usage.reasoning.output_tokens"]) ?? num(a["ai.usage.outputTokenDetails.reasoningTokens"]);
+      t.reasoning =
+        num(a["gen_ai.usage.reasoning.output_tokens"]) ??
+        num(a["ai.usage.outputTokenDetails.reasoningTokens"]) ??
+        num(a["llm.token_count.completion_details.reasoning"]);
       if (!t.cacheKnown) cacheUnknown++;
       tokens = t;
-    } else if (s.error) {
+    } else if (s.error && !partial) {
       failed++;
+    } else if (s.dropped > 0) {
+      lostToLimit++;
     } else {
       noUsage++;
     }
@@ -285,7 +328,15 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
   if (cacheUnknown)
     notes.push(`${cacheUnknown} call(s) report no cache usage; their cost is an upper bound (cached tokens priced at full rate)`);
   if (noUsage) notes.push(`${noUsage} model call(s) have no usage data (not priced)`);
-  if (failed) notes.push(`${failed} model call(s) failed with an error status (not priced)`);
+  if (lostToLimit)
+    notes.push(
+      `${lostToLimit} model call(s) lost their usage to the sender's span attribute limit (not priced); ` +
+        `raise it, e.g. OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=10000`,
+    );
+  if (failed)
+    notes.push(
+      `${failed} model call(s) failed with an error status and have no usage in the trace (not priced; the provider may still bill them, e.g. a response cut off at its output limit)`,
+    );
   if (aggregates) notes.push(`${aggregates} aggregate span(s) skipped to avoid double counting`);
   if (resets) notes.push(`${resets} context reset(s): the prompt shrank, so repeat and cache rules start over there`);
   if (orphanTools) notes.push(`${orphanTools} tool span(s) started before any model call`);
@@ -294,7 +345,11 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
   return {
     id: `${basename(file)}#${traceId.slice(0, 12)}`,
     source: "otlp",
-    dialect: list.some((s) => str(s.attrs["ai.operationId"])?.startsWith("ai.")) ? "ai-sdk" : "gen_ai",
+    dialect: list.some((s) => openInferenceKind(s))
+      ? "openinference"
+      : list.some((s) => str(s.attrs["ai.operationId"])?.startsWith("ai."))
+        ? "ai-sdk"
+        : "gen_ai",
     file,
     agent: service,
     labels: labelsOf(list),
@@ -329,6 +384,8 @@ function labelsOf(list: Span[]): Record<string, string> {
   // The AI SDK's ai.* spans name the agent by functionId; its semconv spans put the same value in gen_ai.agent.name.
   for (const s of list) keep("gen_ai.agent.name", s.attrs["gen_ai.agent.name"]);
   for (const s of list) keep("gen_ai.agent.name", s.attrs["ai.telemetry.functionId"]);
+  // OpenInference names the agent on its AGENT spans.
+  for (const s of list) if (openInferenceKind(s) === "AGENT") keep("gen_ai.agent.name", s.attrs["agent.name"]);
   const service = list.find((s) => s.service)?.service;
   if (service) keep("service.name", service);
   // A plain object again; spreading defines "__proto__" as an own key, it never sets the prototype.
@@ -363,8 +420,11 @@ function markContextResets(turns: Turn[]): number {
 
 function toolFromSpan(s: Span): ToolCall {
   const a = s.attrs;
-  const name = str(a["gen_ai.tool.name"]) ?? str(a["ai.toolCall.name"]) ?? s.name.replace(/^execute_tool\s+/, "");
-  const rawArgs = a["gen_ai.tool.call.arguments"] ?? a["ai.toolCall.args"];
+  const oi = openInferenceKind(s) === "TOOL";
+  const name =
+    str(a["gen_ai.tool.name"]) ?? str(a["ai.toolCall.name"]) ?? str(a["tool.name"]) ?? s.name.replace(/^execute_tool\s+/, "");
+  // OpenInference's generic input.value / output.value are a tool's arguments and result only on TOOL spans.
+  const rawArgs = a["gen_ai.tool.call.arguments"] ?? a["ai.toolCall.args"] ?? (oi ? a["input.value"] : undefined);
   let input: unknown = rawArgs;
   if (typeof rawArgs === "string") {
     try {
@@ -374,7 +434,7 @@ function toolFromSpan(s: Span): ToolCall {
     }
   }
   const { kind, target } = classifyTool(name, input);
-  const result = a["gen_ai.tool.call.result"] ?? a["ai.toolCall.result"];
+  const result = a["gen_ai.tool.call.result"] ?? a["ai.toolCall.result"] ?? (oi ? a["output.value"] : undefined);
   return {
     id: str(a["gen_ai.tool.call.id"]) ?? str(a["ai.toolCall.id"]) ?? s.spanId,
     ts: nanoToIso(s.start),

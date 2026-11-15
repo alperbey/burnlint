@@ -176,7 +176,7 @@ function runDiff(paths: string[], values: { format: string; "group-by"?: string;
   const prices = new PriceTable(values.prices ? loadPrices(values.prices) : undefined);
   let result: DiffResult;
   try {
-    result = diff([paths[0]!], [paths[1]!], { prices, groupBy });
+    result = diff([paths[0]!], [paths[1]!], { prices, groupBy, test: failAbove === undefined ? "two-sided" : "rise" });
   } catch (e) {
     if (e instanceof GroupKeyError) {
       err(`--group-by ${groupBy}: ${e.message}`);

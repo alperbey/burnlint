@@ -1,6 +1,6 @@
 # burnlint
 
-CLI that measures what agent runs cost and finds the avoidable part. Each finding has a rule id, severity, location, what it cost and what fixing it would save. Reads Claude Code session logs and OpenTelemetry GenAI (OTLP/JSON) traces. Framework-agnostic by design: new agents are supported by adding a reader or a dialect mapper, never by special-casing rules.
+CLI that measures what agent runs cost and finds the avoidable part. Each finding has a rule id, severity, location, what it cost and what fixing it would save. Reads Claude Code session logs and OpenTelemetry traces (GenAI `gen_ai.*`, Vercel AI SDK `ai.*`, OpenInference), as OTLP/JSON or recorded from protobuf. Framework-agnostic by design: new agents are supported by adding a reader or a dialect mapper, never by special-casing rules.
 
 ## Purpose
 
@@ -12,7 +12,7 @@ burnlint supports P&L decisions about agents. Primary users are people building 
 - `npm test` builds (tsc) and runs node:test on `dist/test/*.test.js`
 - `node dist/cli.js audit <paths>` (no path = `~/.claude/projects`; `-v` for each occurrence, `--runs-per-month <n>` for a monthly projection, `-f json|md`)
 - `node dist/cli.js diff <base> <head>` (cost per run before/after, grouped; `--group-by <label>`, `--fail-above <pct>`, `-f json`)
-- `node dist/cli.js record -o run.jsonl` (OTLP/HTTP JSON receiver on 127.0.0.1:4318, Ctrl-C to stop)
+- `node dist/cli.js record -o run.jsonl` (OTLP/HTTP receiver, protobuf or JSON, on 127.0.0.1:4318, Ctrl-C to stop)
 - `npm run update-prices` refreshes `src/pricing/prices.json` from LiteLLM
 
 ## Layout
@@ -24,7 +24,7 @@ burnlint supports P&L decisions about agents. Primary users are people building 
 - `src/record.ts` OTLP/HTTP receiver for `record`: appends each trace export as one JSONL line, JSON written as received, protobuf decoded by `src/otlp-protobuf.ts` (hand-written, no dependency) into the same OTLP/JSON form
 - `src/audit.ts` file discovery, format detection, runs rules; `src/diff.ts` before/after comparison and its permutation test; `src/report.ts` table/json/md; `src/cli.ts`
 - `fixtures/` real traces only (redacted), plus the script that generated each one. `*-exports.ndjson` hold raw OTLP/HTTP request bodies (from `scripts/gen-protobuf-fixture.mjs` and `scripts/gen-protobuf-fixture-python.py`), not trace files; `audit` skips `.ndjson`. `scripts/redact-claude-code.mjs` does the same for a Claude Code session log (allowlist of what the reader uses). `scripts/redact-capture.mjs` turns picked traces of a `record` capture into a fixture (content removed, tool results replaced by same-length filler, equal where equal; numbered file lines keep their numbers and get per-line filler, keyed with a per-run secret)
-- `bench/<framework>/` agents run to capture real traces, each with its own pinned package.json (never a dependency of burnlint). `bench/ai-sdk/agent.mjs`: read-only code reviewer on the Vercel AI SDK, 3 tasks x normal/wasteful/nocache; tools read a pinned commit (`--snapshot`) so batches on different days see the same code. Raw captures go to `captures/` (gitignored: they hold prompts and tool results)
+- `bench/<framework>/` agents run to capture real traces, each with its own pinned package.json (never a dependency of burnlint). `bench/ai-sdk/agent.mjs`: read-only code reviewer on the Vercel AI SDK, 3 tasks x normal/wasteful/nocache; tools read a pinned commit (`--snapshot`) so batches on different days see the same code. `bench/openai-agents/agent.py`: the same tasks on the OpenAI Agents SDK + OpenInference (Python, pinned `requirements.txt`, own `.venv`), variants normal/prefix/reread. Raw captures go to `captures/` (gitignored: they hold prompts and tool results)
 
 ## Principles
 
@@ -77,6 +77,14 @@ Vercel AI SDK 7.0.157 + @ai-sdk/otel 1.0.157 + @ai-sdk/anthropic 4.0.92, Claude 
 - Semconv `gen_ai.tool.call.result` holds a string result JSON-encoded (`"\"1\\tfoo\""`).
 - Semconv `chat` spans carry the prompt as sent per step: `gen_ai.tool.definitions`, `gen_ai.system_instructions` (from that step's `instructions`, so a per-step timestamp shows), `gen_ai.input.messages` (role + parts, the SDK's normalized view: provider options and signatures dropped). The reader keeps only hashes (`promptKeys`). Legacy `ai.prompt.tools` is a list of strings (arrayValue).
 
+OpenAI Agents SDK 0.24.0 + openinference-instrumentation-openai-agents 2.8.3 (OTel Python SDK 1.45.2), gpt-5.4-mini, captured through `record` (fixtures/openai-agents-*.jsonl):
+- Span kind in `openinference.span.kind` (LLM, TOOL, AGENT, CHAIN); model spans are named `response`. A span with that attribute is a model call or tool only by its kind.
+- Usage: `llm.token_count.prompt` (includes cache reads), `.prompt_details.cache_read`, `.prompt_details.cache_write` (always 0 on OpenAI: its cache is automatic), `.completion`, `.completion_details.reasoning`. Model `llm.model_name` (dated, e.g. gpt-5.4-mini-2026-03-17), provider `llm.system`, no `llm.provider`.
+- TOOL spans: `tool.name`, arguments as JSON in `input.value`, the result as text in `output.value`, no call id. `agent.name` on AGENT spans.
+- Every message is flattened into attributes (`llm.input_messages.N...`), and `llm.invocation_parameters` holds `instructions` (the system prompt). At the OTel Python default of 128 attributes per span, the oldest are dropped first, token counts included (`droppedAttributesCount` > 0); `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT` raises it.
+- A failed call (including a response cut off at `max_output_tokens`, which OpenAI bills) is an error span with only `llm.system` and the kind: no model, no usage.
+- Instrumentation is exclusive by default: it replaces the SDK's upload of traces to OpenAI.
+
 ## Roadmap (M2, in order)
 
 NOTES.md holds the dated log of captures, checks and decisions; keep this section to the current state.
@@ -91,13 +99,14 @@ Done:
 
 - Published `burnlint@0.1.0` to npm (2026-11-14, tag `v0.1.0`, 4858f1e). Alper runs `npm publish --auth-type=web` in his own terminal (security-key 2FA; a non-interactive shell gets EOTP). npm stages a first publish (`0.0.0-stage` placeholder, then the real version). Before each publish: `npm publish --dry-run`, a tarball install, and compare the published `dist.shasum` with a local `npm pack`.
 
+- Second builder framework: OpenAI Agents SDK via OpenInference (2026-11-14, bench in `bench/openai-agents/`, about $1.50): tokens and cost equal the SDK's own usage on all 18 checked runs; `reread-unchanged` fires on 6/6 reread runs and on none of 12 others; usage lost to the span attribute limit is reported as such. Reviewed independently (Fable 5.2, 2026-11-15) and fixed; version 0.2.0 (with protobuf), not yet published.
+
 Next, in order:
-1. A second builder framework, from a real capture: OpenAI Agents SDK, or LangGraph via OpenInference.
-2. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
+1. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
 
 Later, unordered:
 - `diff`: findings added/removed; Markdown output; a GitHub Action; let the user allow label keys the content filter drops (`bench.input_id`, `bench.context`; Alper, 2026-11-14).
-- Capture gaps: a lost automatic cache on OpenAI/Gemini (they report cache reads but no writes, so `cache-thrash` never fires there; needs a real capture); caching off on a volatile prefix reports nothing; failed legacy `ai.*` runs aren't recognized as model calls; an attempt hidden inside an SDK retry is invisible in the trace (don't flag warm starts as retries).
+- Capture gaps: a lost automatic cache on OpenAI/Gemini (they report cache reads but no writes, so `cache-thrash` never fires there; seen on a real capture, `openai-agents-explain.jsonl` prefix run: 0 reads, +22-45% cost, no finding); caching off on a volatile prefix reports nothing; failed legacy `ai.*` runs aren't recognized as model calls; an attempt hidden inside an SDK retry is invisible in the trace (don't flag warm starts as retries).
 - Rules, only once a real trace shows money there: `oversized-tool-result`, `retry-loop`, `context-growth`. `model-overkill` after outcomes (counterfactual, needs careful wording).
 - More dialect mappers, each from a real capture: Claude Code OTel spans (`claude_code.*`, needs CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1; tool inputs need OTEL_LOG_TOOL_DETAILS=1), Codex CLI rollout JSONL + OTel, Gemini CLI (`gemini_cli.*`, `outfile` setting), Qwen Code (`qwen-code.*`).
 - An MCP server over the JSON output: a cheap add-on, not a priority.

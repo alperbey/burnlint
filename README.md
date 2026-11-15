@@ -8,6 +8,8 @@ It works on any agent, not one framework:
 
 - **Claude Code** session logs (`~/.claude/projects/**/*.jsonl`), no setup needed
 - **OpenTelemetry GenAI traces** (`gen_ai.*` spans, OTLP/JSON), which most agent SDKs and CLIs can emit
+- **OpenInference traces** (`openinference.span.kind` spans), checked on the OpenAI Agents SDK
+- Any of these as protobuf or JSON, recorded from a running agent with `burnlint record`
 
 Everything runs locally. No network calls, and message content is never printed.
 
@@ -82,8 +84,8 @@ burnlint diff  grouped by bench.task
 - **Overall.** The headline is the mean of the group means, weighted by base's mix of runs. When the two sides ran groups in different proportions, the plain pooled means are shown too. Groups with runs on one side only are listed and left out.
 - **Noise.** Agent runs vary a lot from run to run (the same task cost $0.11 to $0.24 over three runs in one capture). The verdict comes from a permutation test: within each group, runs are relabeled base/head in every possible way, and the observed change is compared with what relabeling gives. With one run per group on each side this becomes a sign test over the groups. `too few runs` means no outcome of these runs could be told from noise. The noise figure is about two standard errors of the change.
 - **Same inputs.** Both sides must run the same tasks on the same inputs. An agent whose task reads the repo it runs in costs more as the repo grows, with no change to the agent: our own bench rose 11% in a day for that reason. Pin what the agent reads (a fixed commit, fixed documents).
-- **CI.** `--fail-above <pct>` exits 1 when the measured rise is above that and the runs show a rise clearly (one-sided p < 0.05). It doesn't test that the rise exceeds the threshold, so with many runs a measured 10.5% with a wide spread fails a 10% gate. A rise the runs can't separate from noise prints a warning and passes. False alarms in CI are worse than a late catch. A simulation at the run-to-run noise of our bench gave these detection rates with 3 runs per task: a 10% rise about half the time, 15% most of the time (86%), 20% almost always. To catch 10%, use 5 or more runs per task.
-- **What it won't call.** If either side has runs with calls that have no price (an unknown model, or no usage), the verdict is `can't tell`, and `--fail-above` exits 2. Add the price with `--prices`. Runs with a failed call are counted per side. A failed run usually stops early and costs less, so the output notes when head has more of them. A change of model is noted as a trade-off: cost alone doesn't show whether the work still gets done.
+- **CI.** `--fail-above <pct>` exits 1 when the measured rise is above that and the runs show a rise clearly (one-sided p < 0.05). With it set, the headline judges a rise the same way, so the two always agree; a fall is still judged two-sided. It doesn't test that the rise exceeds the threshold, so with many runs a measured 10.5% with a wide spread fails a 10% gate. A rise the runs can't separate from noise prints a warning and passes. False alarms in CI are worse than a late catch. A simulation at the run-to-run noise of our bench gave these detection rates with 3 runs per task: a 10% rise about half the time, 15% most of the time (86%), 20% almost always. To catch 10%, use 5 or more runs per task.
+- **What it won't call.** If either side has runs with calls that have no price (an unknown model, or no usage), the verdict is `can't tell`, and `--fail-above` exits 2. Add the price with `--prices`. Runs with a failed call are counted per side. A failed call has no usage in the trace but may still be billed (a response cut off at its output limit is), and a failed run usually stops early, so the output notes them and when head has more of them. A change of model is noted as a trade-off: cost alone doesn't show whether the work still gets done.
 - A run is counted as in `audit`: an OTLP trace, or a Claude Code session with its sub-agents.
 
 ## Recording a running agent
@@ -172,7 +174,7 @@ Accepts a single export request, an array of them, or JSONL with one per line (t
 - Tool calls: `execute_tool` spans. Duplicate and reread rules need `gen_ai.tool.call.arguments`, which most instrumentations only record with content capture turned on.
 - Provider: read from `gen_ai.provider.name` or the older `gen_ai.system`, then checked against `server.address` and the model name. Calls to DeepSeek, Qwen and others made through an OpenAI-compatible client are reported as `openai` by the instrumentation and get relabeled, so they are priced correctly.
 - `gen_ai.usage.input_tokens` is taken as the total prompt; `cache_read` / `cache_creation` input tokens are subtracted when present. DeepSeek's own cache field is read if an instrumentation records it.
-- A span with error status and no usage is a failed call. A run whose calls all failed is counted apart, not as a $0 run.
+- A span with error status and no usage is a failed call: unpriced, and noted, since the provider may still have billed it. A run whose calls all failed is counted apart, not as a $0 run.
 - One trace can hold several conversations (a second agent call, a sub-agent). A call whose prompt is much smaller than the previous one (under 80%, and at least 1,024 tokens less) starts a new context, so repeat and cache rules start over there.
 
 ### Vercel AI SDK
@@ -183,6 +185,41 @@ Checked against AI SDK 7.0.157 with `@ai-sdk/otel` 1.0.157, on real captures (`f
 - `LegacyOpenTelemetry` emits `ai.*` spans: one model call per `ai.generateText.doGenerate` / `ai.streamText.doStream` span (`ai.operationId`), cache reads and writes from `ai.usage.inputTokenDetails`, tool calls from `ai.toolCall` spans. AI SDK 6 and earlier emit this format by default; that has not been checked on a capture yet.
 - Retries inside the SDK are one span: an attempt that failed before a retry leaves no trace of its own, so its cost can't be counted.
 
+### OpenAI Agents SDK (via OpenInference)
+
+Checked against `openai-agents` 0.24.0 with `openinference-instrumentation-openai-agents` 2.8.3 and the OpenTelemetry Python SDK 1.45.2, on real runs with gpt-5.4-mini (`fixtures/openai-agents-*.jsonl`): tokens and cost per run equal the SDK's own usage on every run checked.
+
+```
+pip install openai-agents openinference-instrumentation-openai-agents \
+  opentelemetry-sdk opentelemetry-exporter-otlp-proto-http
+```
+
+```python
+from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+OpenAIAgentsInstrumentor().instrument(tracer_provider=provider)
+# ... run your agents, then provider.shutdown() so the last spans are sent
+```
+
+```
+burnlint record -o run.jsonl      # in one terminal
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=10000 \
+  python your_agent.py            # in another
+```
+
+- **Raise the attribute limit.** OpenInference writes every message of the conversation into the model span's attributes, and the Python SDK keeps 128 per span by default, dropping the oldest first: the token counts. Past about five calls in a conversation, calls lose their usage. burnlint reports those calls as lost to the limit, not as free, and doesn't price them. `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=10000` (or `SpanLimits(max_span_attributes=...)` on the provider) avoids it.
+- The instrumentation replaces the SDK's own upload of traces to OpenAI by default, so traces go only where you export them.
+- Model calls are `LLM` spans (model `llm.model_name`, provider `llm.system`); tool calls are `TOOL` spans, with their arguments and results. Cache reads come from `llm.token_count.prompt_details.cache_read`.
+- OpenAI caches prompts on its own and reports cache reads but not writes. When a prompt prefix changes every call (a timestamp in the instructions), the cache is lost and the run costs more, but no rule reports it yet: `cache-thrash` needs the rewrite. `diff` shows it as a rise with the cache share dropping.
+- A call that fails, including a response cut off at its output limit (which OpenAI bills), carries no usage in the trace: it is noted, left unpriced, and the run's cost is a lower bound.
+- The trace holds the full prompts and tool results (the recorder writes them to a file only your user can read). burnlint never prints them.
+
 ## Related tools
 
 - [ccusage](https://github.com/ryoppippi/ccusage) reports how much coding-agent CLIs spent, by day, session and model. burnlint reports which part of that spend was avoidable.
@@ -190,14 +227,15 @@ Checked against AI SDK 7.0.157 with `@ai-sdk/otel` 1.0.157, on real captures (`f
 
 ## Status
 
-v0.1. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP (protobuf or JSON).
+v0.2. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), OpenAI Agents SDK via OpenInference, four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP (protobuf or JSON).
 
 While the version is 0.x, the fields of `-f json` output may change between minor versions; changes are noted in the release notes.
 
 Next:
 
-- Dialect mappers checked against real exports: OpenAI Agents SDK, LangGraph and OpenInference first, then Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans
 - Outcomes (pass/fail per run), so `diff` can report cost per successful run; then a GitHub Action
+- A lost automatic prompt cache on OpenAI and Gemini, which report cache reads but not writes
+- Dialect mappers checked against real exports: other OpenInference instrumentations (LangGraph), Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans
 - More rules (`oversized-tool-result`, `retry-loop`, `context-growth`) once real traces show money there
 
 ## Development
@@ -209,7 +247,7 @@ npm test
 
 `scripts/gen-record-fixture.mjs` regenerates the `record` fixture by sending spans through the official OpenTelemetry JS OTLP exporter to a running `burnlint record` (package versions are pinned in the script).
 
-`fixtures/ai-sdk-v7-*.jsonl` are real runs of `bench/ai-sdk/agent.mjs` (a read-only code-review agent on Claude Sonnet 5.5), captured with `burnlint record` and redacted with `scripts/redact-capture.mjs`: prompts and model output are removed, tool results replaced by filler of the same length (equal where they were equal).
+`fixtures/ai-sdk-v7-*.jsonl` are real runs of `bench/ai-sdk/agent.mjs` (a read-only code-review agent on Claude Sonnet 5.5), captured with `burnlint record` and redacted with `scripts/redact-capture.mjs`: prompts and model output are removed, tool results replaced by filler of the same length (equal where they were equal). `fixtures/openai-agents-*.jsonl` are real runs of `bench/openai-agents/agent.py` (the same agent on the OpenAI Agents SDK, gpt-5.4-mini), redacted the same way.
 
 `scripts/gen-otel-deepseek-fixture.py` regenerates the OTel fixture by running the official `opentelemetry-instrumentation-openai-v2` against a local mock DeepSeek server (needs `openai`, `opentelemetry-sdk`, `opentelemetry-instrumentation-openai-v2==2.3b0`, `opentelemetry-exporter-otlp-proto-common`, `wrapt<2`).
 

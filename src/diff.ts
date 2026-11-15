@@ -75,6 +75,12 @@ export interface Overall {
   /** Smallest two-sided p these runs can give; at or above 0.05 no change can be shown. */
   minP: number;
   /**
+   * How a rise is judged: "two-sided" (pTwoSided), or "rise" (pHigher) when a
+   * CI gate tests for a rise, so the verdict and the gate agree. A fall is
+   * always judged two-sided.
+   */
+  test: DiffTest;
+  /**
    * About two standard errors of the change, as a share of base: changes
    * within it are run-to-run noise. null when a group has one run on both sides.
    */
@@ -83,10 +89,13 @@ export interface Overall {
 }
 
 export type Verdict = "higher" | "lower" | "no clear change" | "too few runs" | "can't tell";
+export type DiffTest = "two-sided" | "rise";
 
 export interface DiffOptions extends AuditOptions {
   /** Label key to group runs by. Default: gen_ai.agent.name, else project, else one group. */
   groupBy?: string;
+  /** "rise" when a gate (--fail-above) is set: a rise is then judged one-sided, as the gate judges it. */
+  test?: DiffTest;
 }
 
 export const DEFAULT_GROUP_KEYS = ["gen_ai.agent.name", "project"];
@@ -123,7 +132,7 @@ export class GroupKeyError extends Error {}
 export function compare(
   baseRuns: RunSummary[],
   headRuns: RunSummary[],
-  opts: { groupBy?: string; basePaths?: string[]; headPaths?: string[]; prices?: AuditResult["prices"] } = {},
+  opts: { groupBy?: string; test?: DiffTest; basePaths?: string[]; headPaths?: string[]; prices?: AuditResult["prices"] } = {},
 ): DiffResult {
   const all = [...baseRuns, ...headRuns];
   let groupBy = opts.groupBy;
@@ -163,7 +172,7 @@ export function compare(
       base: countedB.filter((u) => u.group === g.name).map((u) => u.cost),
       head: countedH.filter((u) => u.group === g.name).map((u) => u.cost),
     }));
-    result.overall = overall(samples, result);
+    result.overall = overall(samples, result, opts.test);
   }
   return result;
 }
@@ -247,7 +256,7 @@ const statistic = (gs: Sample[]) => gs.reduce((s, g) => s + g.weight * (meanOf(g
  * each group, runs are relabeled base/head in every way that keeps the group's
  * counts, and the same weighted difference is computed each time.
  */
-export function overall(gs: Sample[], r: Pick<DiffResult, "base" | "head">): Overall {
+export function overall(gs: Sample[], r: Pick<DiffResult, "base" | "head">, test: DiffTest = "two-sided"): Overall {
   const baseUsd = gs.reduce((s, g) => s + g.weight * meanOf(g.base), 0);
   const headUsd = gs.reduce((s, g) => s + g.weight * meanOf(g.head), 0);
   const observed = headUsd - baseUsd;
@@ -263,22 +272,29 @@ export function overall(gs: Sample[], r: Pick<DiffResult, "base" | "head">): Ove
   const minP = method === "exact" ? values.filter((v) => Math.abs(v) >= most - eps).length / values.length : 1 / (SAMPLES + 1);
   const change = baseUsd > 0 ? observed / baseUsd : null;
   const pTwoSided = p(either);
+  const pHigher = p(higher);
+  // One-sided, the smallest p is the share of relabelings at the top alone.
+  const top = values.reduce((m, v) => Math.max(m, v), -Infinity);
+  const minPRise = method === "exact" ? values.filter((v) => v >= top - eps).length / values.length : 1 / (SAMPLES + 1);
+  const rise = test === "rise";
 
   let verdict: Verdict;
   if (r.base.unpriced || r.head.unpriced) verdict = "can't tell";
-  else if (minP >= SIGNIFICANCE) verdict = "too few runs";
-  else if (pTwoSided < SIGNIFICANCE) verdict = observed > 0 ? "higher" : "lower";
+  else if ((rise ? Math.min(minP, minPRise) : minP) >= SIGNIFICANCE) verdict = "too few runs";
+  else if (observed > 0 && (rise ? pHigher : pTwoSided) < SIGNIFICANCE) verdict = "higher";
+  else if (observed < 0 && pTwoSided < SIGNIFICANCE) verdict = "lower";
   else verdict = "no clear change";
 
   return {
     baseUsd,
     headUsd,
     change,
-    pHigher: p(higher),
+    pHigher,
     pTwoSided,
     method,
     permutations,
     minP,
+    test,
     noise: noise(gs, baseUsd),
     verdict,
   };
