@@ -228,6 +228,7 @@ Checked against AI SDK 7.0.157 with `@ai-sdk/otel` 1.0.157, on real captures (`f
 - The default `OpenTelemetry` integration emits GenAI spans (`invoke_agent`, `chat`, `execute_tool`), read as above, cache reads and writes included.
 - `LegacyOpenTelemetry` emits `ai.*` spans: one model call per `ai.generateText.doGenerate` / `ai.streamText.doStream` span (`ai.operationId`), cache reads and writes from `ai.usage.inputTokenDetails`, tool calls from `ai.toolCall` spans. AI SDK 6 and earlier emit this format by default; that has not been checked on a capture yet.
 - Retries inside the SDK are one span: an attempt that failed before a retry leaves no trace of its own, so its cost can't be counted.
+- Providers checked on real runs: `@ai-sdk/anthropic` 4.0.92, `@ai-sdk/deepseek` 3.0.76 (27 runs, tokens, cache reads and cost equal to DeepSeek's own usage) and `@ai-sdk/google` 4.0.108 (one run so far; thinking tokens count as output).
 
 ### OpenAI Agents SDK (via OpenInference)
 
@@ -271,14 +272,16 @@ OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=10000 \
 
 ## Status
 
-v0.2. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), OpenAI Agents SDK via OpenInference, four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP (protobuf or JSON). Unreleased: outcomes (`--outcomes`, success rate and cost per successful run, `--fail-success-drop`), and `--group-by` on a key whose name looks like content.
+v0.3. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats; Anthropic, DeepSeek and Gemini providers checked), OpenAI Agents SDK via OpenInference, four rules, cost per run, `diff` for before/after cost per run with a CI gate, outcomes from your own pass/fail file (success rate and cost per successful run, success compared in `diff`, `--fail-success-drop`), table / JSON / Markdown output, `record` for OTLP/HTTP (protobuf or JSON).
+
+New in 0.3: `--outcomes` on `audit` and `diff`, `--fail-success-drop`, and `--group-by` on a key whose name looks like content (`bench.input_id`). JSON output gains `outcomes` (audit), `success` (diff), and `traceId` and `pass` on runs.
 
 While the version is 0.x, the fields of `-f json` output may change between minor versions; changes are noted in the release notes.
 
 Next:
 
 - Outcomes from a span attribute, besides the file; a test for cost per successful run; then a GitHub Action
-- A lost automatic prompt cache on OpenAI and Gemini, which report cache reads but not writes
+- A lost automatic prompt cache on OpenAI, DeepSeek and Gemini, which report cache reads but not writes
 - Dialect mappers checked against real exports: other OpenInference instrumentations (LangGraph), Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans
 - More rules (`oversized-tool-result`, `retry-loop`, `context-growth`) once real traces show money there
 
