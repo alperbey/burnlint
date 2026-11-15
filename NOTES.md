@@ -68,6 +68,8 @@ Independent review by Fable 5.2 of b723afe..b21e003 (read-only, ran its own inpu
 - "on those 1 ÷ 0 passes" now reads "0 of 1 run passed (0.0%) · $0.12 spent on it".
 Deferred to 0.3.1 (CLAUDE.md roadmap): run id merging on a shared 12-hex prefix, the early exit 2 before the success gate, more base64 forms and a BOM.
 
+Published `burnlint@0.3.0` (Alper, `npm publish --auth-type=web`, 2026-11-15) from 71c6520: registry `dist.shasum` 2e566e99695a9c4ffbc360bfbd77236fc9029724 equals the local `npm pack`; `latest` = 0.3.0; a fresh install from the registry runs `audit --outcomes` on the fixtures. Tag `v0.3.0`.
+
 ## DeepSeek and Gemini on the AI SDK bench (2026-11-15)
 
 `bench/ai-sdk/agent.mjs --provider google|deepseek` (pinned `@ai-sdk/google` 4.0.108, `@ai-sdk/deepseek` 3.0.76; defaults gemini-3.8-flash and deepseek-flash, reasoning at medium / DeepSeek "high"; budget guard priced from `prices.json`; each run saves the provider's raw usage summed over steps as `rawUsage`; `nocache` is Anthropic-only).
