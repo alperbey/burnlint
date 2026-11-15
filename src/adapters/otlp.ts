@@ -133,7 +133,16 @@ function parseRequests(text: string): { requests: ExportRequest[]; badLines: num
   }
 }
 
-export function readOtlp(file: string): Run[] {
+export interface ReadOptions {
+  /**
+   * Label keys to keep even though their name looks like content (e.g.
+   * `bench.input_id`): the user named them, for grouping. Values stay short
+   * scalars, as for every label.
+   */
+  allowLabels?: string[];
+}
+
+export function readOtlp(file: string, opts: ReadOptions = {}): Run[] {
   const spans: Span[] = [];
   const { requests, badLines } = parseRequests(readFileSync(file, "utf8"));
   for (const req of requests) {
@@ -165,7 +174,7 @@ export function readOtlp(file: string): Run[] {
 
   const runs: Run[] = [];
   for (const [traceId, list] of byTrace) {
-    const run = buildRun(list, file, traceId);
+    const run = buildRun(list, file, traceId, new Set(opts.allowLabels));
     if (badLines) run.notes.push(`${badLines} unparseable line(s) skipped`);
     if (run.turns.length) runs.push(run);
   }
@@ -201,7 +210,7 @@ function isTool(s: Span): boolean {
   );
 }
 
-function buildRun(list: Span[], file: string, traceId: string): Run {
+function buildRun(list: Span[], file: string, traceId: string, allowLabels: Set<string>): Run {
   list.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
   const parent = new Map(list.map((s) => [s.spanId, s.parentSpanId]));
 
@@ -344,6 +353,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
   const service = list.find((s) => s.service)?.service;
   return {
     id: `${basename(file)}#${traceId.slice(0, 12)}`,
+    traceId,
     source: "otlp",
     dialect: list.some((s) => openInferenceKind(s))
       ? "openinference"
@@ -352,7 +362,7 @@ function buildRun(list: Span[], file: string, traceId: string): Run {
         : "gen_ai",
     file,
     agent: service,
-    labels: labelsOf(list),
+    labels: labelsOf(list, allowLabels),
     turns,
     notes,
   };
@@ -367,12 +377,12 @@ const MAX_LABEL_LENGTH = 200;
  * what the run was: a task, a branch, an input id), the agent name and the
  * service name.
  */
-function labelsOf(list: Span[]): Record<string, string> {
+function labelsOf(list: Span[], allow: Set<string>): Record<string, string> {
   const ids = new Set(list.map((s) => s.spanId));
   // No prototype, so an attribute named "constructor" or "__proto__" is an ordinary key.
   const labels: Record<string, string> = Object.create(null);
   const keep = (key: string, value: unknown) => {
-    if (Object.hasOwn(labels, key) || CONTENT_KEY.test(key)) return;
+    if (Object.hasOwn(labels, key) || (CONTENT_KEY.test(key) && !allow.has(key))) return;
     if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") return;
     const v = String(value);
     if (v && v.length <= MAX_LABEL_LENGTH) labels[key] = v;
@@ -499,7 +509,7 @@ function decodedText(result: string): string {
  * OTLP/JSON specifies hex ids, but protobuf's generic JSON mapping (used by
  * some SDK exporters) emits base64. Normalize to hex.
  */
-function hexId(id: string): string {
+export function hexId(id: string): string {
   if (/^[0-9a-f]+$/i.test(id) && (id.length === 32 || id.length === 16)) return id.toLowerCase();
   try {
     const hex = Buffer.from(id, "base64").toString("hex");

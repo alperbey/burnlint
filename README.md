@@ -20,6 +20,7 @@ npx burnlint audit ./traces --runs-per-month 20000  # what it comes to at your v
 npx burnlint audit ./traces --fail-on high -f md   # CI, Markdown for PR comments
 npx burnlint record -o run.jsonl        # capture OTLP traces from a running agent
 npx burnlint diff base.jsonl head.jsonl --fail-above 15  # did this change make runs cost more?
+npx burnlint diff base/ head/ --outcomes outcomes.jsonl  # ...and do they still pass?
 ```
 
 ## Example
@@ -80,13 +81,56 @@ burnlint diff  grouped by bench.task
 
 (Nine runs of the bench agent, each task run normally and then told to reread files before answering. The captures hold prompts and aren't in the repo.)
 
-- **Groups.** Runs are compared within groups, so a head that happened to run more of the cheap task doesn't look cheaper. The default group is `gen_ai.agent.name` (the Vercel AI SDK's `functionId`), then the Claude Code project, else all runs in one group. `--group-by <key>` uses any attribute on a trace's root span, such as a task or input id the harness sets. A key that no run has is refused.
+- **Groups.** Runs are compared within groups, so a head that happened to run more of the cheap task doesn't look cheaper. The default group is `gen_ai.agent.name` (the Vercel AI SDK's `functionId`), then the Claude Code project, else all runs in one group. `--group-by <key>` uses any attribute on a trace's root span, such as a task or input id the harness sets. A key that no run has is refused. Keys whose names look like content (`input`, `prompt`, `output`, ...) are never kept as labels, except the one you name in `--group-by`: `--group-by bench.input_id` works, and its values are short scalars like every label.
 - **Overall.** The headline is the mean of the group means, weighted by base's mix of runs. When the two sides ran groups in different proportions, the plain pooled means are shown too. Groups with runs on one side only are listed and left out.
 - **Noise.** Agent runs vary a lot from run to run (the same task cost $0.11 to $0.24 over three runs in one capture). The verdict comes from a permutation test: within each group, runs are relabeled base/head in every possible way, and the observed change is compared with what relabeling gives. With one run per group on each side this becomes a sign test over the groups. `too few runs` means no outcome of these runs could be told from noise. The noise figure is about two standard errors of the change.
 - **Same inputs.** Both sides must run the same tasks on the same inputs. An agent whose task reads the repo it runs in costs more as the repo grows, with no change to the agent: our own bench rose 11% in a day for that reason. Pin what the agent reads (a fixed commit, fixed documents).
 - **CI.** `--fail-above <pct>` exits 1 when the measured rise is above that and the runs show a rise clearly (one-sided p < 0.05). With it set, the headline judges a rise the same way, so the two always agree; a fall is still judged two-sided. It doesn't test that the rise exceeds the threshold, so with many runs a measured 10.5% with a wide spread fails a 10% gate. A rise the runs can't separate from noise prints a warning and passes. False alarms in CI are worse than a late catch. A simulation at the run-to-run noise of our bench gave these detection rates with 3 runs per task: a 10% rise about half the time, 15% most of the time (86%), 20% almost always. To catch 10%, use 5 or more runs per task.
-- **What it won't call.** If either side has runs with calls that have no price (an unknown model, or no usage), the verdict is `can't tell`, and `--fail-above` exits 2. Add the price with `--prices`. Runs with a failed call are counted per side. A failed call has no usage in the trace but may still be billed (a response cut off at its output limit is), and a failed run usually stops early, so the output notes them and when head has more of them. A change of model is noted as a trade-off: cost alone doesn't show whether the work still gets done.
+- **What it won't call.** If either side has runs with calls that have no price (an unknown model, or no usage), the verdict is `can't tell`, and `--fail-above` exits 2. Add the price with `--prices`. Runs with a failed call are counted per side. A failed call has no usage in the trace but may still be billed (a response cut off at its output limit is), and a failed run usually stops early, so the output notes them and when head has more of them. A change of model is noted as a trade-off: cost alone doesn't show whether the work still gets done. Add `--outcomes` to see that next to cost.
 - A run is counted as in `audit`: an OTLP trace, or a Claude Code session with its sub-agents.
+
+### Success and cost per successful run
+
+A cheaper run that does the work worse isn't cheaper. burnlint doesn't judge output; your tests or evals do, and `--outcomes <file>` joins their verdicts to cost, on `audit` and `diff`. The file has one JSON object per line:
+
+```
+{"run": "71416a2f7d5e9561c2d933c805b5cd61", "pass": true}
+{"run": "69227109187db8b6eb5277e875078c69", "pass": false, "score": 0.4, "notes": "..."}
+```
+
+`run` is the run's OTLP trace id (hex, or base64 as some exporters write it) or its Claude Code session id. `pass` is `true` or `false`. Other keys are ignored and never printed. A line that can't be read, or a run listed both as pass and fail, is refused with its line number; a file none of whose ids match a run exits 2 (usually the wrong file or the wrong id).
+
+What counts as a failure is yours to decide, but one rule keeps the numbers honest: **`false` when your agent ran and didn't deliver, for any reason of its own** (a wrong answer, its turn limit, its cost cap, a response cut off at its output limit); **no row only when you couldn't grade it or something outside the agent broke** (a provider outage, a rate limit, the harness). A run with no row is unknown, never a failure. Leaving out the runs that hit their own limits drops the likeliest and often most expensive failures.
+
+`audit` adds a line:
+
+```
+  per success  $0.085   17 of 22 runs passed (77.3%) · $1.45 on those 22 ÷ 17 passes, failed runs included · no outcome for 2 of 24
+```
+
+Cost per successful run is everything spent on runs with an outcome, passed or failed, divided by the passes: what one success costs you. Every run with an outcome counts, including runs that never got a priced call (they're left out of cost per run, but they are usually failures); when any such run has calls without a price or usage, the figure is marked as a lower bound.
+
+`diff` compares success the way it compares cost: per group, at base's mix of groups, with the same permutation test (on failures instead of dollars), and shows passes per group and cost per success before and after. From the OpenAI Agents SDK bench (gpt-5.4-mini): normal runs against runs whose prompt prefix changes on every call, which loses OpenAI's automatic cache:
+
+```
+$ burnlint diff normal.jsonl prefix.jsonl --group-by bench.task --outcomes outcomes.jsonl
+  ...
+  cost per run  $0.032 → $0.043   no clear change: +34%, not clearly beyond run-to-run noise (p=0.07)
+  success       100.0% → 83.3%   too few runs to tell (-17 points): no change these runs could show would reach p<0.05; run more, or group by input (--group-by)
+                passed 6/6 → 5/6 · per success $0.032 → $0.052 (all spend on runs with an outcome, failed runs included) · at base's mix of groups
+
+  group      side  runs    mean  ...  cache  passed
+  explain    base     3  $0.032  ...    30%     3/3
+             head     3  $0.039  ...     0%     3/3  +22%
+  principle  base     3  $0.033  ...    26%     3/3
+             head     3  $0.047  ...     0%     2/3  +45%
+```
+
+If any compared run has no outcome, the success verdict is `can't tell`. Cost per success gets no verdict of its own yet.
+
+**Few runs can only show a collapse.** Pass/fail carries little information per run. With 3 runs per group, no drop is ever clear, not even 3/3 → 0/3. With 5 runs, 5/5 → 1/5 is; 5/5 → 2/5 isn't. Over 3 tasks × 5 runs, 15/15 → 10/15 is. The test is much stronger when each input is its own group (`--group-by` with an input id on the root span): it then works like a sign test, and five inputs that flip from pass to fail, with none flipping back, are a clear drop.
+
+**CI.** `--fail-success-drop <points>` exits 1 when the success rate fell more than that many percentage points and the runs show a drop clearly (one-sided p < 0.05). A drop the runs can't show prints a warning and passes; a compared run with no outcome exits 2. It is separate from `--fail-above`, which stays about cost; with both set, either can fail the build. Without the success gate, a drop in success is still written to stderr, so a green cost check doesn't hide it.
 
 ## Recording a running agent
 
@@ -227,13 +271,13 @@ OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=10000 \
 
 ## Status
 
-v0.2. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), OpenAI Agents SDK via OpenInference, four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP (protobuf or JSON).
+v0.2. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats), OpenAI Agents SDK via OpenInference, four rules, cost per run, `diff` for before/after cost per run with a CI gate, table / JSON / Markdown output, `record` for OTLP/HTTP (protobuf or JSON). Unreleased: outcomes (`--outcomes`, success rate and cost per successful run, `--fail-success-drop`), and `--group-by` on a key whose name looks like content.
 
 While the version is 0.x, the fields of `-f json` output may change between minor versions; changes are noted in the release notes.
 
 Next:
 
-- Outcomes (pass/fail per run), so `diff` can report cost per successful run; then a GitHub Action
+- Outcomes from a span attribute, besides the file; a test for cost per successful run; then a GitHub Action
 - A lost automatic prompt cache on OpenAI and Gemini, which report cache reads but not writes
 - Dialect mappers checked against real exports: other OpenInference instrumentations (LangGraph), Codex CLI, Gemini CLI, Qwen Code, Claude Code OTel spans
 - More rules (`oversized-tool-result`, `retry-loop`, `context-growth`) once real traces show money there
@@ -247,7 +291,7 @@ npm test
 
 `scripts/gen-record-fixture.mjs` regenerates the `record` fixture by sending spans through the official OpenTelemetry JS OTLP exporter to a running `burnlint record` (package versions are pinned in the script).
 
-`fixtures/ai-sdk-v7-*.jsonl` are real runs of `bench/ai-sdk/agent.mjs` (a read-only code-review agent on Claude Sonnet 5.5), captured with `burnlint record` and redacted with `scripts/redact-capture.mjs`: prompts and model output are removed, tool results replaced by filler of the same length (equal where they were equal). `fixtures/openai-agents-*.jsonl` are real runs of `bench/openai-agents/agent.py` (the same agent on the OpenAI Agents SDK, gpt-5.4-mini), redacted the same way.
+`fixtures/ai-sdk-v7-*.jsonl` are real runs of `bench/ai-sdk/agent.mjs` (a read-only code-review agent on Claude Sonnet 5.5), captured with `burnlint record` and redacted with `scripts/redact-capture.mjs`: prompts and model output are removed, tool results replaced by filler of the same length (equal where they were equal). `fixtures/openai-agents-*.jsonl` are real runs of `bench/openai-agents/agent.py` (the same agent on the OpenAI Agents SDK, gpt-5.4-mini), redacted the same way. `fixtures/openai-agents-outcomes.jsonl` holds the bench's grades for those runs (the cut-off review run as a failure).
 
 `scripts/gen-otel-deepseek-fixture.py` regenerates the OTel fixture by running the official `opentelemetry-instrumentation-openai-v2` against a local mock DeepSeek server (needs `openai`, `opentelemetry-sdk`, `opentelemetry-instrumentation-openai-v2==2.3b0`, `opentelemetry-exporter-otlp-proto-common`, `wrapt<2`).
 

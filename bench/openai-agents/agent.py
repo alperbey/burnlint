@@ -39,7 +39,10 @@ Options:
               checks the pipeline only. Its traces must never become a fixture.
   --grade <dir>   re-grade saved answers and exit.
 
-Answers and per-run results go to out/ (runs.jsonl: trace id, usage, grade).
+Answers and per-run results go to out/ (runs.jsonl: trace id, usage, grade). out/outcomes.jsonl
+holds pass/fail per run for `burnlint audit|diff --outcomes`: a graded run passes or fails on its
+grade; a run stopped by its own limits (turns, the run cap, a response cut off at max_tokens)
+fails; a run broken by something outside the agent (network, provider, rate limit) gets no row.
 Traces carry prompts, tool results and answers (OpenInference records them by
 default); burnlint never prints them.
 """
@@ -63,7 +66,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from agents import Agent, ModelSettings, RunConfig, RunHooks, Runner, function_tool
-from agents.exceptions import MaxTurnsExceeded
+from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
 from openai.types.shared import Reasoning
 from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
 from opentelemetry import trace
@@ -464,6 +467,7 @@ async def run_once(task: str, variant: str, rep: int, batch: str, tracer) -> tup
             )
 
         config = RunConfig(workflow_name=f"reviewer-{task}")
+        outcome: bool | None = None
         try:
             answer = await Runner.run(agent("answer"), TASKS[task], max_turns=opt.max_turns, hooks=guard, run_config=config)
             check_input = answer.to_input_list() + [{"role": "user", "content": CHECK["reread" if variant == "reread" else "normal"]}]
@@ -486,7 +490,17 @@ async def run_once(task: str, variant: str, rep: int, batch: str, tracer) -> tup
                 f"{label:<24} {record['steps']:>2} steps  in {u['input']}  cached {u['cached']}  out {u['output']} "
                 f"(reasoning {u['reasoning']})  ~${guard.usd:.3f}  {'pass' if g['pass'] else 'FAIL ' + failed}"
             )
-        except (RunCapReached, MaxTurnsExceeded, Exception) as e:  # noqa: B014 - named for the reader
+            outcome = g["pass"]
+        except (RunCapReached, MaxTurnsExceeded, ModelBehaviorError) as e:
+            # The agent's own limits: it ran, spent, and didn't deliver. A failure.
+            # (ModelBehaviorError includes a response cut off at max_tokens.)
+            outcome = False
+            record["error"] = f"{type(e).__name__}: {e}"
+            span.record_exception(e)
+            print(f"{label}: {record['error']}", file=sys.stderr)
+        except Exception as e:
+            # Outside the agent (network, provider, rate limit, this script): unknown, no outcome.
+            outcome = None
             record["error"] = f"{type(e).__name__}: {e}"
             span.record_exception(e)
             print(f"{label}: {record['error']}", file=sys.stderr)
@@ -495,6 +509,9 @@ async def run_once(task: str, variant: str, rep: int, batch: str, tracer) -> tup
             record["seconds"] = round(time.time() - started)
             with open(Path("out", "runs.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
+        if outcome is not None and not opt.mock:
+            with open(Path("out", "outcomes.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"run": trace_id, "pass": outcome, "task": task, "variant": variant, "batch": batch}) + "\n")
     return guard.usd, record.get("error")
 
 

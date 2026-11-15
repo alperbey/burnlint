@@ -181,6 +181,15 @@ function totalLines(r: AuditResult): Array<[string, string, string]> {
     const { runsPerMonth, spendUsd, avoidableUsd } = r.projection;
     lines.push(["per month", usdTotal(spendUsd), `at ${int(runsPerMonth)} runs, ${usdTotal(avoidableUsd)} of it avoidable`]);
   }
+  const o = r.outcomes;
+  if (o) {
+    const parts = o.known
+      ? [`${o.passed} of ${plural(o.known, "run")} passed (${pct(o.successRate!)})`, `${usd(o.costUsd)} on those ${o.known} ÷ ${o.passed} passes, failed runs included`]
+      : [`no run here has an outcome in ${short(o.file)}`];
+    if (o.known && o.known < o.runs) parts.push(`no outcome for ${o.runs - o.known} of ${o.runs}`);
+    if (o.incomplete) parts.push(`lower bound: ${plural(o.incomplete, "run")} priced in part`);
+    lines.push(["per success", o.costPerSuccessUsd == null ? (o.known ? "no passes" : "?") : usdTotal(o.costPerSuccessUsd), parts.join(" · ")]);
+  }
   const w = Math.max(...lines.map((l) => l[1].length));
   return lines.map(([label, value, note]) => [label, value.padStart(w), note]);
 }
@@ -236,6 +245,7 @@ function noteLines(r: AuditResult, runs: Map<string, RunSummary>, verbose: boole
   }
   const unpriced = [...new Set(r.runs.flatMap((run) => run.unpricedModels))];
   if (unpriced.length) out.push(`no price for model(s): ${unpriced.join(", ")} (add them with --prices)`);
+  if (r.outcomes?.unmatchedRows) out.push(`${plural(r.outcomes.unmatchedRows, "row")} in ${short(r.outcomes.file)} name no run here`);
   if (r.skippedFiles.length)
     out.push(`${plural(r.skippedFiles.length, "file")} could not be read${verbose ? ": " + r.skippedFiles.map(short).join(", ") : " (-v lists them)"}`);
   if (verbose && r.ignoredFiles.length) out.push(`${plural(r.ignoredFiles.length, "file")} in the scanned folders are not traces and were ignored`);
@@ -309,6 +319,42 @@ export function verdictLine(r: DiffResult): string {
   }
 }
 
+const signedPoints = (x: number | null) => {
+  if (x == null) return "?";
+  const v = x * 100;
+  const s = Math.abs(v) < 10 && v !== Math.round(v) ? v.toFixed(1) : v.toFixed(0);
+  return `${v > 0 ? "+" : ""}${s} points`;
+};
+
+/** The success verdict in one line. */
+export function successVerdictLine(r: DiffResult): string {
+  const s = r.success;
+  if (!s) return "";
+  if (!s.groups.length) return "nothing to compare: no group has runs on both sides";
+  const ch = signedPoints(s.change);
+  const oneSided = s.test === "rise" && (s.change ?? 0) < 0;
+  const p = oneSided ? `one-sided ${pValue(s.pDrop)}` : pValue(s.pTwoSided);
+  switch (s.verdict) {
+    case "higher":
+      return `higher, ${ch} (${p})`;
+    case "lower":
+      return `lower, ${ch} (${p})`;
+    case "no clear change":
+      return s.change === 0 ? `no change` : `no clear change: ${ch}, not clearly beyond chance (${p})`;
+    case "too few runs":
+      return (
+        `too few runs to tell (${ch}): no change these runs could show would reach p<${SIGNIFICANCE}; ` +
+        `run more, or group by input (--group-by)`
+      );
+    case "can't tell": {
+      const compared = s.groups.reduce((n, g) => n + g.base.runs + g.head.runs - g.base.known - g.head.known, 0);
+      return compared
+        ? `can't tell: ${plural(compared, "compared run")} with no outcome in ${short(s.file)}`
+        : `can't tell: a group has no run with an outcome on one side`;
+    }
+  }
+}
+
 export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): string {
   const r = plainDeep(result);
   const c = (code: string, s: string) => (opts.color && s ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -340,10 +386,29 @@ export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): st
   } else {
     out.push(`  ${verdictLine(r)}`);
   }
+  const s = r.success;
+  if (s) {
+    const color = s.verdict === "lower" ? "1;31" : s.verdict === "higher" ? "1;32" : "1";
+    const rates = s.baseRate != null && s.headRate != null ? `${pct(s.baseRate)} → ${pct(s.headRate)}` : "? → ?";
+    const lead = `  success       ${rates}   `;
+    hanging(lead, successVerdictLine(r), opts.width).forEach((l, i) => out.push(i ? l : lead + c(color, l.slice(lead.length))));
+    const passed = (x: { known: number; passed: number; runs: number }) =>
+      `${x.passed}/${x.known}${x.known < x.runs ? ` (${x.runs - x.known} without outcome)` : ""}`;
+    const sub = [`passed ${passed(s.base)} → ${passed(s.head)}`];
+    const cps = s.costPerSuccess;
+    if (cps.baseUsd != null || cps.headUsd != null)
+      sub.push(
+        `per success ${cps.baseUsd == null ? "no passes" : usd(cps.baseUsd)} → ${cps.headUsd == null ? "no passes" : usd(cps.headUsd)}` +
+          ` (all spend on runs with an outcome, failed runs included${cps.lowerBound ? "; lower bound: some runs priced in part" : ""})`,
+      );
+    if (s.groups.length > 1) sub.push("at base's mix of groups");
+    out.push(...hanging(" ".repeat(16), sub.join(" · "), opts.width).map(dim));
+  }
   out.push("");
 
   if (r.groups.length) {
-    const head = ["group", "side", "runs", "mean", "median", "min", "max", "calls", "prompt tok", "output tok", "cache", ""];
+    const succ = new Map((r.success?.groups ?? []).map((g) => [g.name, g]));
+    const head = ["group", "side", "runs", "mean", "median", "min", "max", "calls", "prompt tok", "output tok", "cache", ...(r.success ? ["passed"] : []), ""];
     const rows: string[][] = [];
     for (const g of r.groups) {
       for (const [side, s] of [["base", g.base], ["head", g.head]] as const) {
@@ -359,6 +424,7 @@ export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): st
           int(Math.round(s.promptTokens)),
           int(Math.round(s.outputTokens)),
           s.cacheShare == null ? "?" : `${(s.cacheShare * 100).toFixed(0)}%`,
+          ...(r.success ? [passedCell(succ.get(g.name)?.[side])] : []),
           side === "head" ? signedPct(g.change) : "",
         ]);
       }
@@ -368,7 +434,12 @@ export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): st
     const line = (cells: string[]) => "  " + cells.map((s, i) => (left(i) ? s.padEnd(w[i]!) : s.padStart(w[i]!))).join("  ").trimEnd();
     out.push(dim(line(head)));
     for (const row of rows) out.push(line(row));
-    out.push(dim(`  per run means; cache = cache reads as a share of prompt tokens`));
+    out.push(
+      dim(
+        `  per run means; cache = cache reads as a share of prompt tokens` +
+          (r.success ? `; passed = passes of runs with an outcome, every run counted (also those with no priced call)` : ""),
+      ),
+    );
     out.push("");
   }
 
@@ -381,6 +452,9 @@ export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): st
   out.push(...hanging("", `Costs are estimates. Prices: ${r.prices.source}, retrieved ${r.prices.retrieved}.`, opts.width).map(dim));
   return out.join("\n");
 }
+
+const passedCell = (x: { runs: number; known: number; passed: number } | undefined) =>
+  x ? `${x.passed}/${x.known}${x.known < x.runs ? ` ?${x.runs - x.known}` : ""}` : "";
 
 const headShared = (r: DiffResult) => r.groups.reduce((s, g) => s + g.head.runs, 0);
 
@@ -396,9 +470,10 @@ function diffNotes(r: DiffResult): string[] {
     );
   }
   if (b.models.join() !== h.models.join())
-    out.push(`models: base ${b.models.join(", ") || "?"}; head ${h.models.join(", ") || "?"}. A model change is a trade-off: cost alone doesn't show whether the work still gets done`);
+    out.push(`models: base ${b.models.join(", ") || "?"}; head ${h.models.join(", ") || "?"}. A model change is a trade-off: ${r.success ? "weigh cost against success above" : "cost alone doesn't show whether the work still gets done; add --outcomes"}`);
   const unpriced = [...new Set([...b.unpricedModels, ...h.unpricedModels])];
   if (unpriced.length) out.push(`no price for model(s): ${unpriced.join(", ")} (add them with --prices)`);
+  if (r.success?.unmatchedRows) out.push(`${plural(r.success.unmatchedRows, "row")} in ${short(r.success.file)} name no run on either side`);
   if (r.onlyBase.length) out.push(`only in base, not compared: ${r.onlyBase.join(", ")}`);
   if (r.onlyHead.length) out.push(`only in head, not compared: ${r.onlyHead.join(", ")}`);
   return out;

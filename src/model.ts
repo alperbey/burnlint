@@ -106,6 +106,8 @@ export interface Run {
   /** Telemetry dialect, e.g. "gen_ai". */
   dialect?: string;
   file: string;
+  /** OTLP trace id, lowercase hex: what an outcomes file names the run by. */
+  traceId?: string;
   /** Sub-agent / sidechain label when the run is not the main thread; service name for OTLP. */
   agent?: string;
   /** Session the run belongs to (a sub-agent's is its parent's). */

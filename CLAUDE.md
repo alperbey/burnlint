@@ -10,8 +10,8 @@ burnlint supports P&L decisions about agents. Primary users are people building 
 
 - `npm install`
 - `npm test` builds (tsc) and runs node:test on `dist/test/*.test.js`
-- `node dist/cli.js audit <paths>` (no path = `~/.claude/projects`; `-v` for each occurrence, `--runs-per-month <n>` for a monthly projection, `-f json|md`)
-- `node dist/cli.js diff <base> <head>` (cost per run before/after, grouped; `--group-by <label>`, `--fail-above <pct>`, `-f json`)
+- `node dist/cli.js audit <paths>` (no path = `~/.claude/projects`; `-v` for each occurrence, `--runs-per-month <n>` for a monthly projection, `--outcomes <file>` for success and cost per successful run, `-f json|md`)
+- `node dist/cli.js diff <base> <head>` (cost per run before/after, grouped; `--group-by <label>`, `--fail-above <pct>`, `--outcomes <file>`, `--fail-success-drop <points>`, `-f json`)
 - `node dist/cli.js record -o run.jsonl` (OTLP/HTTP receiver, protobuf or JSON, on 127.0.0.1:4318, Ctrl-C to stop)
 - `npm run update-prices` refreshes `src/pricing/prices.json` from LiteLLM
 
@@ -22,7 +22,7 @@ burnlint supports P&L decisions about agents. Primary users are people building 
 - `src/rules/` one pure function per rule, registered in `rules/index.ts`
 - `src/pricing.ts` price lookup, cost math, provider inference/relabeling
 - `src/record.ts` OTLP/HTTP receiver for `record`: appends each trace export as one JSONL line, JSON written as received, protobuf decoded by `src/otlp-protobuf.ts` (hand-written, no dependency) into the same OTLP/JSON form
-- `src/audit.ts` file discovery, format detection, runs rules; `src/diff.ts` before/after comparison and its permutation test; `src/report.ts` table/json/md; `src/cli.ts`
+- `src/audit.ts` file discovery, format detection, runs rules; `src/outcomes.ts` the user's pass/fail file (reading, id normalization); `src/diff.ts` before/after comparison and its permutation test (cost, and success on failures); `src/report.ts` table/json/md; `src/cli.ts`
 - `fixtures/` real traces only (redacted), plus the script that generated each one. `*-exports.ndjson` hold raw OTLP/HTTP request bodies (from `scripts/gen-protobuf-fixture.mjs` and `scripts/gen-protobuf-fixture-python.py`), not trace files; `audit` skips `.ndjson`. `scripts/redact-claude-code.mjs` does the same for a Claude Code session log (allowlist of what the reader uses). `scripts/redact-capture.mjs` turns picked traces of a `record` capture into a fixture (content removed, tool results replaced by same-length filler, equal where equal; numbered file lines keep their numbers and get per-line filler, keyed with a per-run secret)
 - `bench/<framework>/` agents run to capture real traces, each with its own pinned package.json (never a dependency of burnlint). `bench/ai-sdk/agent.mjs`: read-only code reviewer on the Vercel AI SDK, 3 tasks x normal/wasteful/nocache; tools read a pinned commit (`--snapshot`) so batches on different days see the same code. `bench/openai-agents/agent.py`: the same tasks on the OpenAI Agents SDK + OpenInference (Python, pinned `requirements.txt`, own `.venv`), variants normal/prefix/reread. Raw captures go to `captures/` (gitignored: they hold prompts and tool results)
 
@@ -34,6 +34,7 @@ burnlint supports P&L decisions about agents. Primary users are people building 
 - Findings never include tool inputs (queries, commands). Paths and tool names are fine.
 - Terminal output is part of the product. `message` is one short line; per-occurrence detail goes in `details` (shown with -v). The table groups findings by run, wraps to the terminal width, and keeps one line per finding when piped. Severity follows `avoidableUsd`; trade-offs and fixes that save nothing are `info` and never fail `--fail-on`. Files found while scanning a folder that aren't traces are ignored quietly; a named file that can't be read is reported.
 - burnlint measures cost, not output quality. Every finding has a `fix` effect: `no-loss` (the fix removes only what the model already had) or `trade-off` (it changes what the model sees or which model runs). Only no-loss findings get `avoidableUsd`, net of what the fix itself costs (cache-thrash expiry assumes a keep-alive for up to `keepAliveHours`, default 12, never hindsight). Trade-off rules (`context-growth`, `model-overkill`) report cost only, until a benchmark shows task success holds.
+- Outcomes come from the user (`--outcomes`, JSONL `{"run", "pass"}`); burnlint never grades output. A run with no row is unknown, never failed; success counts every unit with an outcome, including runs cost per run leaves out (no priced call). Cost per successful run = all spend on runs with an outcome / passes, a lower bound when any of those runs is priced in part. In `diff`, any compared run without an outcome makes success `can't tell`; `--fail-success-drop` is separate from `--fail-above` and passes, with a warning, a drop the runs can't show. Errors name line numbers and keys, never values (notes may hold model output). The rule for users and the benches: `false` when the agent ran and didn't deliver for a reason of its own (wrong answer, turn limit, cost cap, output cut off), no row when nobody could grade it or something outside the agent broke.
 - Cost per run counts only runs with at least one priced call; runs that failed (error status, Claude Code `isApiErrorMessage`) or carried no usage are counted apart, never as $0 runs. A failed call leaves the cache state alone.
 - `cache-thrash` fires on a lost cache (read < what the previous call left cached), never on a large write alone; savable is min(lost, written) at write minus read, checked against a stable-prefix counterfactual on a real capture.
 - The CLI refuses what it would otherwise ignore: unknown rule ids, non-numeric thresholds, options of another command, unknown price fields. Zero runs audited exits 2.
@@ -101,11 +102,14 @@ Done:
 
 - Second builder framework: OpenAI Agents SDK via OpenInference (2026-11-14, bench in `bench/openai-agents/`, about $1.50): tokens and cost equal the SDK's own usage on all 18 checked runs; `reread-unchanged` fires on 6/6 reread runs and on none of 12 others; usage lost to the span attribute limit is reported as such. Reviewed independently (Fable 5.2, 2026-11-15) and fixed. Published as `burnlint@0.2.0` (2026-11-15, with protobuf; tag `v0.2.0`, 840346d; `latest`).
 
+- Outcomes, sidecar file (2026-11-15, unreleased): `--outcomes` on audit and diff, success rate and cost per successful run, success in `diff` tested like cost (stratified permutation test on failures), `--fail-success-drop`. Design reviewed by Fable 5.2 before building. Checked on the OpenAI Agents SDK capture: cost per success $0.08516 from burnlint vs $0.08515 from the bench's own usage (22 runs, 17 passed; the bench rounds each run to 4 decimals). Power: 3 runs a group can't show any drop; grouping by input makes it a sign test. Both benches write `out/outcomes.jsonl`. `--group-by` keeps the named key even if the content filter would drop it (`bench.input_id`).
+
 Next, in order:
-1. Outcomes: pass/fail per run (span attribute or a sidecar file), cost per successful run, and `diff` reporting success beside cost. This is what lets trade-off levers be advised.
+1. Release 0.3.0 with outcomes, once Alper has looked at the output.
+2. Outcomes from a span attribute (needs a real agent that records one); a verdict for cost per successful run (a ratio: needs its own test). These are what let trade-off levers (model choice, context size) be advised.
 
 Later, unordered:
-- `diff`: findings added/removed; Markdown output; a GitHub Action; let the user allow label keys the content filter drops (`bench.input_id`, `bench.context`; Alper, 2026-11-14).
+- `diff`: findings added/removed; Markdown output; a GitHub Action.
 - Capture gaps: a lost automatic cache on OpenAI/Gemini (they report cache reads but no writes, so `cache-thrash` never fires there; seen on a real capture, `openai-agents-explain.jsonl` prefix run: 0 reads, +22-45% cost, no finding); caching off on a volatile prefix reports nothing; failed legacy `ai.*` runs aren't recognized as model calls; an attempt hidden inside an SDK retry is invisible in the trace (don't flag warm starts as retries).
 - Rules, only once a real trace shows money there: `oversized-tool-result`, `retry-loop`, `context-growth`. `model-overkill` after outcomes (counterfactual, needs careful wording).
 - More dialect mappers, each from a real capture: Claude Code OTel spans (`claude_code.*`, needs CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1; tool inputs need OTEL_LOG_TOOL_DETAILS=1), Codex CLI rollout JSONL + OTel, Gemini CLI (`gemini_cli.*`, `outfile` setting), Qwen Code (`qwen-code.*`).

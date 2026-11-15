@@ -2,12 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, join } from "node:path";
 import { parseArgs } from "node:util";
-import { audit, severityRank } from "./audit.js";
-import { diff, gate, GroupKeyError, type DiffResult } from "./diff.js";
+import { audit, severityRank, type RunSummary } from "./audit.js";
+import { diff, gate, GroupKeyError, successGate, type DiffResult } from "./diff.js";
+import { outcomeId, OutcomesError, readOutcomes, type Outcomes } from "./outcomes.js";
 import type { Severity } from "./model.js";
 import { PriceTable, type Price } from "./pricing.js";
 import { DEFAULT_PORT, defaultRecordFile, startRecorder } from "./record.js";
-import { renderDiffJson, renderDiffTable, renderJson, renderMarkdown, renderTable, verdictLine } from "./report.js";
+import { renderDiffJson, renderDiffTable, renderJson, renderMarkdown, renderTable, successVerdictLine, verdictLine } from "./report.js";
 import { defaultConfig, rules } from "./rules/index.js";
 import { plainText } from "./text.js";
 
@@ -34,6 +35,9 @@ Options:
       --high-usd <n>             Cost for high severity (default 1)
       --medium-usd <n>           Cost for medium severity (default 0.1)
       --runs-per-month <n>       Project spend and avoidable spend to this many runs a month
+      --outcomes <file.jsonl>    Pass/fail per run from your own tests or evals, one JSON object a
+                                 line: {"run": "<OTLP trace id or Claude Code session id>", "pass": true}.
+                                 Adds success rate and cost per successful run. Other keys are ignored.
   -v, --verbose                  Show each occurrence, file paths and all notes
   -h, --help
       --version
@@ -50,6 +54,13 @@ Diff:
                                  can't tell from noise passes. Inputs must be the same on both
                                  sides: a task that reads a growing repo costs more by itself. With 3 runs per group, only rises
                                  of 15-20% or more are reliably seen; use 5+ runs for 10%.
+      --outcomes <file.jsonl>    Pass/fail per run, as for audit: adds success before and after,
+                                 tested like cost, and cost per successful run
+      --fail-success-drop <pts>  Exit 1 if the success rate fell more than this many percentage
+                                 points and the runs show a drop clearly (one-sided p < 0.05).
+                                 Few runs can only show a collapse: 3 runs per group never show
+                                 a drop; 5 per group show 5/5 -> 1/5. Grouping by input (a label
+                                 per input, --group-by) makes each input count on its own.
   -f, --format <table|json>      Output format (default: table)
       --prices <file.json>       Price overrides, as for audit
 
@@ -69,8 +80,8 @@ const err = (line: string) => process.stderr.write(plainText(line) + "\n");
 
 /** Options each command takes. Anything else on the command line is refused, not ignored. */
 const COMMAND_OPTIONS: Record<string, string[]> = {
-  audit: ["format", "fail-on", "rule", "prices", "high-usd", "medium-usd", "runs-per-month", "verbose"],
-  diff: ["format", "group-by", "fail-above", "prices"],
+  audit: ["format", "fail-on", "rule", "prices", "high-usd", "medium-usd", "runs-per-month", "outcomes", "verbose"],
+  diff: ["format", "group-by", "fail-above", "fail-success-drop", "outcomes", "prices"],
   record: ["out", "port", "verbose"],
   rules: [],
 };
@@ -146,7 +157,30 @@ async function record(values: { out?: string; port?: string; verbose: boolean })
   return 0;
 }
 
-function runDiff(paths: string[], values: { format: string; "group-by"?: string; "fail-above"?: string; prices?: string }): number {
+/** The outcomes file, or an exit code after saying why it can't be used. */
+function loadOutcomes(file: string | undefined): Outcomes | undefined | number {
+  if (file === undefined) return undefined;
+  try {
+    return readOutcomes(file);
+  } catch (e) {
+    if (e instanceof OutcomesError) {
+      err(e.message);
+      return 2;
+    }
+    throw e;
+  }
+}
+
+/** A file none of whose rows names a run here is the wrong file or the wrong kind of id. */
+function noMatch(o: Outcomes, runs: RunSummary[]): string {
+  const example = runs[0] ? `; runs here have ids like ${outcomeId(runs[0])}` : "";
+  return `--outcomes ${o.file}: none of its ${o.rows.size} run id(s) match a run here (ids are OTLP trace ids or Claude Code session ids${example})`;
+}
+
+function runDiff(
+  paths: string[],
+  values: { format: string; "group-by"?: string; "fail-above"?: string; "fail-success-drop"?: string; outcomes?: string; prices?: string },
+): number {
   if (paths.length !== 2) {
     err(`diff takes two paths, base and head (got ${paths.length})`);
     return 2;
@@ -167,6 +201,18 @@ function runDiff(paths: string[], values: { format: string; "group-by"?: string;
     err(`--fail-above must be a percentage of zero or more, got "${raw}"`);
     return 2;
   }
+  const rawDrop = values["fail-success-drop"];
+  const failDrop = rawDrop === undefined ? undefined : Number(rawDrop);
+  if (failDrop !== undefined && (rawDrop!.trim() === "" || !Number.isFinite(failDrop) || failDrop < 0 || failDrop > 100)) {
+    err(`--fail-success-drop must be a number of percentage points from 0 to 100, got "${rawDrop}"`);
+    return 2;
+  }
+  if (failDrop !== undefined && values.outcomes === undefined) {
+    err(`--fail-success-drop needs --outcomes: pass/fail per run from your tests or evals`);
+    return 2;
+  }
+  const outcomes = loadOutcomes(values.outcomes);
+  if (typeof outcomes === "number") return outcomes;
   const groupBy = values["group-by"];
   if (groupBy !== undefined && !groupBy.trim()) {
     err(`--group-by needs a label key`);
@@ -176,7 +222,13 @@ function runDiff(paths: string[], values: { format: string; "group-by"?: string;
   const prices = new PriceTable(values.prices ? loadPrices(values.prices) : undefined);
   let result: DiffResult;
   try {
-    result = diff([paths[0]!], [paths[1]!], { prices, groupBy, test: failAbove === undefined ? "two-sided" : "rise" });
+    result = diff([paths[0]!], [paths[1]!], {
+      prices,
+      groupBy,
+      outcomes,
+      test: failAbove === undefined ? "two-sided" : "rise",
+      successTest: failDrop === undefined ? "two-sided" : "rise",
+    });
   } catch (e) {
     if (e instanceof GroupKeyError) {
       err(`--group-by ${groupBy}: ${e.message}`);
@@ -185,6 +237,11 @@ function runDiff(paths: string[], values: { format: string; "group-by"?: string;
     throw e;
   }
 
+  if (outcomes && result.success && result.success.unmatchedRows === outcomes.rows.size) {
+    // Runs aren't kept on the result; any unit id serves as the example.
+    err(noMatch(outcomes, []));
+    return 2;
+  }
   if (values.format === "json") process.stdout.write(renderDiffJson(result) + "\n");
   else
     process.stdout.write(
@@ -204,19 +261,42 @@ function runDiff(paths: string[], values: { format: string; "group-by"?: string;
     err(`burnlint: no group has priced runs on both sides; nothing was compared`);
     return 2;
   }
-  if (failAbove === undefined) return 0;
-  const g = gate(result, failAbove);
-  const ch = result.overall?.change;
-  const rose = ch == null ? "" : `${(ch * 100).toFixed(1)}%`;
-  if (g === "can't tell") {
-    err(`burnlint: --fail-above ${failAbove}%: can't decide, ${verdictLine(result)}`);
-    return 2;
+  // Both gates report; a clear failure of either wins over the other's "can't decide".
+  const codes: number[] = [];
+  if (failAbove !== undefined) {
+    const g = gate(result, failAbove);
+    const ch = result.overall?.change;
+    const rose = ch == null ? "" : `${(ch * 100).toFixed(1)}%`;
+    if (g === "can't tell") {
+      err(`burnlint: --fail-above ${failAbove}%: can't decide, ${verdictLine(result)}`);
+      codes.push(2);
+    } else if (g === "fail") {
+      err(`burnlint: cost per run rose ${rose}, above ${failAbove}% (one-sided p=${result.overall!.pHigher.toPrecision(2)})`);
+      codes.push(1);
+    } else if (g === "unclear") err(`burnlint: cost per run rose ${rose}, above ${failAbove}%, but not enough runs to tell it from noise; passing`);
   }
-  if (g === "fail") {
-    err(`burnlint: cost per run rose ${rose}, above ${failAbove}% (one-sided p=${result.overall!.pHigher.toPrecision(2)})`);
-    return 1;
+  if (failDrop !== undefined) {
+    const s = result.success!;
+    const g = successGate(result, failDrop);
+    const fell = s.change == null ? "" : `${(-s.change * 100).toFixed(1)} points`;
+    const counts = `${s.base.passed}/${s.base.known} -> ${s.head.passed}/${s.head.known} passed`;
+    if (g === "can't tell") {
+      err(`burnlint: --fail-success-drop ${failDrop}: can't decide, ${successVerdictLine(result)}`);
+      codes.push(2);
+    } else if (g === "fail") {
+      err(`burnlint: success fell ${fell} (${counts}), more than ${failDrop} points (one-sided p=${s.pDrop.toPrecision(2)})`);
+      codes.push(1);
+    } else if (g === "too few runs")
+      err(`burnlint: success fell ${fell} (${counts}), more than ${failDrop} points, but no drop these runs could show would be clear; passing. Run more per group, or group by input`);
+    else if (g === "unclear")
+      err(`burnlint: success fell ${fell} (${counts}), more than ${failDrop} points, but not clearly beyond chance (one-sided p=${s.pDrop.toPrecision(2)}); passing`);
+  } else if (result.success && (result.success.change ?? 0) < 0) {
+    // A green cost gate shouldn't be silent about fewer passes.
+    const x = result.success;
+    err(`burnlint: head passed less often (${x.base.passed}/${x.base.known} -> ${x.head.passed}/${x.head.known}); success: ${successVerdictLine(result)}`);
   }
-  if (g === "unclear") err(`burnlint: cost per run rose ${rose}, above ${failAbove}%, but not enough runs to tell it from noise; passing`);
+  if (codes.includes(1)) return 1;
+  if (codes.includes(2)) return 2;
   return 0;
 }
 
@@ -235,6 +315,8 @@ async function main(argv: string[]): Promise<number> {
       "runs-per-month": { type: "string" },
       "group-by": { type: "string" },
       "fail-above": { type: "string" },
+      "fail-success-drop": { type: "string" },
+      outcomes: { type: "string" },
       out: { type: "string", short: "o" },
       port: { type: "string" },
       verbose: { type: "boolean", short: "v", default: false },
@@ -325,12 +407,18 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
+  const outcomes = loadOutcomes(values.outcomes);
+  if (typeof outcomes === "number") return outcomes;
   const prices = new PriceTable(values.prices ? loadPrices(values.prices) : undefined);
   const config: Record<string, number> = {};
   if (highUsd !== undefined) config.highUsd = highUsd;
   if (mediumUsd !== undefined) config.mediumUsd = mediumUsd;
 
-  const result = audit(targets, { prices, config, only: values.rule, runsPerMonth });
+  const result = audit(targets, { prices, config, only: values.rule, runsPerMonth, outcomes });
+  if (outcomes && result.runs.length && result.outcomes!.unmatchedRows === outcomes.rows.size) {
+    err(noMatch(outcomes, result.runs));
+    return 2;
+  }
 
   if (format === "json") process.stdout.write(renderJson(result) + "\n");
   else if (format === "md") process.stdout.write(renderMarkdown(result) + "\n");

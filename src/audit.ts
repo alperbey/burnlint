@@ -1,8 +1,9 @@
 import { closeSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import { looksLikeClaudeCode, readClaudeCode } from "./adapters/claude-code.js";
-import { looksLikeOtlp, readOtlp } from "./adapters/otlp.js";
+import { looksLikeOtlp, readOtlp, type ReadOptions } from "./adapters/otlp.js";
 import { cacheWriteTotal, type Finding, type Run, type Severity } from "./model.js";
+import { outcomeId, type Outcomes } from "./outcomes.js";
 import { callCost, PriceTable } from "./pricing.js";
 import { defaultConfig, rules, type RuleConfig } from "./rules/index.js";
 
@@ -10,6 +11,8 @@ export interface RunSummary {
   id: string;
   file: string;
   source: string;
+  /** OTLP trace id (hex). */
+  traceId?: string;
   agent?: string;
   session?: string;
   project?: string;
@@ -30,6 +33,8 @@ export interface RunSummary {
   /** What the run was, for grouping (see Run.labels); `project` for Claude Code. */
   labels: Record<string, string>;
   notes: string[];
+  /** From the outcomes file: did the run's unit of work succeed. Absent when the file has no row for it. */
+  pass?: boolean;
 }
 
 export interface AuditResult {
@@ -51,7 +56,34 @@ export interface AuditResult {
   excludedRuns: { failed: number; unpriced: number };
   /** Spend and avoidable spend at a stated volume. Only when one was given. */
   projection?: Projection;
+  /** Only when an outcomes file was given. */
+  outcomes?: OutcomesSummary;
   prices: { source: string; retrieved: string };
+}
+
+/**
+ * Success and what a success costs. Over every unit of work with an outcome,
+ * including runs left out of cost per run (no priced call): those are the
+ * likeliest failures.
+ */
+export interface OutcomesSummary {
+  file: string;
+  /** Units of work found. */
+  runs: number;
+  /** Units with a row in the file. */
+  known: number;
+  passed: number;
+  failed: number;
+  /** Rows in the file that name no run here (the file may cover other batches). */
+  unmatchedRows: number;
+  /** passed / known; null when no run has an outcome. */
+  successRate: number | null;
+  /** Spend on units with an outcome, passed and failed. */
+  costUsd: number;
+  /** costUsd / passed: what one success costs, failed runs' spend included. null with no passes. */
+  costPerSuccessUsd: number | null;
+  /** Units with an outcome and calls that couldn't be priced: costPerSuccessUsd is a lower bound. */
+  incomplete: number;
 }
 
 /**
@@ -88,6 +120,10 @@ export interface AuditOptions {
   rules?: boolean;
   /** Expected volume, to project spend and avoidable spend to a month. */
   runsPerMonth?: number;
+  /** Pass/fail per run, from the user. */
+  outcomes?: Outcomes;
+  /** Label keys to keep although they look like content (named by the user for grouping). */
+  allowLabels?: string[];
 }
 
 const SEVERITY_RANK: Record<Severity, number> = { high: 3, medium: 2, low: 1, info: 0 };
@@ -140,9 +176,9 @@ function head(file: string, bytes = 65536): string {
   }
 }
 
-export function loadRuns(file: string): Run[] | null {
+export function loadRuns(file: string, opts: ReadOptions = {}): Run[] | null {
   const text = head(file);
-  if (looksLikeOtlp(text)) return readOtlp(file);
+  if (looksLikeOtlp(text)) return readOtlp(file, opts);
   if (looksLikeClaudeCode(text.split("\n").slice(0, 20))) return readClaudeCode(file);
   return null;
 }
@@ -162,7 +198,7 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
   for (const file of files) {
     let runs: Run[] | null;
     try {
-      runs = loadRuns(file);
+      runs = loadRuns(file, { allowLabels: opts.allowLabels });
     } catch (e) {
       skippedFiles.push(`${file} (${(e as Error).message})`);
       continue;
@@ -202,6 +238,7 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
         id: run.id,
         file: run.file,
         source: run.source,
+        ...(run.traceId ? { traceId: run.traceId } : {}),
         agent: run.agent,
         session: run.session,
         project: run.project,
@@ -229,6 +266,7 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
       (b.costUsd ?? -1) - (a.costUsd ?? -1),
   );
 
+  const outcomes = opts.outcomes ? outcomesOf(summaries, opts.outcomes) : undefined;
   const totalCostUsd = summaries.reduce((s, r) => s + r.costUsd, 0);
   const avoidableUsd = findings.reduce((s, f) => s + (f.avoidableUsd ?? 0), 0);
   const { perRun, excludedRuns } = perRunCosts(summaries, totalCostUsd, avoidableUsd);
@@ -245,6 +283,7 @@ export function audit(paths: string[], opts: AuditOptions = {}): AuditResult {
     perRun,
     excludedRuns,
     ...(n != null && perRun ? { projection: { runsPerMonth: n, spendUsd: perRun.meanUsd * n, avoidableUsd: perRun.avoidableUsd * n } } : {}),
+    ...(outcomes ? { outcomes } : {}),
     prices: { source: prices.source, retrieved: prices.retrieved },
   };
 }
@@ -298,5 +337,42 @@ function perRunCosts(
       incomplete: counted.filter((u) => u.priced < u.calls).length,
     },
     excludedRuns,
+  };
+}
+
+/** Marks each run with its unit's outcome and sums success and its cost over units. */
+function outcomesOf(summaries: RunSummary[], o: Outcomes): OutcomesSummary {
+  const matched = new Set<string>();
+  for (const r of summaries) {
+    const id = outcomeId(r);
+    const pass = o.rows.get(id);
+    if (pass === undefined) continue;
+    r.pass = pass;
+    matched.add(id);
+  }
+  let known = 0;
+  let passed = 0;
+  let costUsd = 0;
+  let incomplete = 0;
+  const units = unitsOf(summaries);
+  for (const rs of units) {
+    const pass = rs.find((r) => r.pass !== undefined)?.pass;
+    if (pass === undefined) continue;
+    known++;
+    if (pass) passed++;
+    costUsd += rs.reduce((s, r) => s + r.costUsd, 0);
+    if (rs.some((r) => r.pricedCalls < r.calls)) incomplete++;
+  }
+  return {
+    file: o.file,
+    runs: units.length,
+    known,
+    passed,
+    failed: known - passed,
+    unmatchedRows: o.rows.size - matched.size,
+    successRate: known ? passed / known : null,
+    costUsd,
+    costPerSuccessUsd: passed ? costUsd / passed : null,
+    incomplete,
   };
 }
