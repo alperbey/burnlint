@@ -1,8 +1,28 @@
 # burnlint
 
-What do your agent's runs cost, and how much of that was avoidable?
+**One line in a system prompt can make every agent run cost 4× more, and your tests will still pass.** burnlint catches it before it ships.
 
-burnlint reads agent traces and reports cost per run (typical, 90th percentile, at your monthly volume) and the spend that was avoidable: repeated tool calls, files read twice, prompt caches rebuilt mid-run. Each finding comes with a severity, what the pattern cost, and how much of that a fix could have saved without taking anything away from the model. `--fail-on` turns it into a CI check.
+We added the current time to an agent's system prompt. It broke the prompt cache on every call: each run cost 4.4 times as much, and 8 of 9 runs still passed. Nothing failed and nothing logged an error. The only place it showed was the bill.
+
+burnlint reads your agent's traces and answers:
+
+- **Did this change make runs more expensive?** Before/after cost per run, with a significance test so run-to-run noise doesn't fail your build (`diff --fail-above`).
+- **What does a run cost at my volume?** Typical, 90th percentile, and per month.
+- **What does a *successful* run cost?** Give it pass/fail per run. A cheaper agent that fails more often isn't cheaper.
+- **Where did money go for nothing?** Prompt caches rebuilt mid-run, files reread unchanged, the same tool called twice: each priced, with what a fix saves.
+
+Try it on your Claude Code history, no setup: `npx burnlint audit`
+
+## Use this when
+
+- Did my prompt change make agent runs more expensive? Is the rise real or noise?
+- Agent cost regression: block a PR that makes runs cost more (`diff --fail-above 15`)
+- Is the cheaper model worth it, or does it fail more often? (cost per successful run)
+- What will this agent cost per month at 20,000 runs?
+- Why did this agent run cost so much more than the others?
+- Claude Code session cost spiked after resume, or `cache_creation_input_tokens` jumped
+- The agent reads the same file over and over, or calls the same tool twice
+- Prompt caching is on, but the cache keeps getting rewritten (Anthropic), or caching was never turned on
 
 It works on any agent, not one framework:
 
