@@ -24,7 +24,8 @@ const NEAR_PASS = ["Pass", "PASS", "passed", "Passed", "passes", "passing", "suc
 
 /**
  * One form per id: hex trace ids and UUIDs (Claude Code sessions) in lowercase,
- * base64 trace ids as hex. Anything else is matched exactly.
+ * base64 trace ids as hex (standard or URL-safe, padded or not). Anything else
+ * is matched exactly.
  */
 export function normalizeRunId(id: string): string {
   const s = id.trim();
@@ -40,12 +41,10 @@ export function normalizeRunId(id: string): string {
 export function readOutcomes(file: string): Outcomes {
   let text: string;
   try {
-    text = readFileSync(file, "utf8");
+    text = readFileSync(file, "utf8").replace(/^\uFEFF/, "");
   } catch (e) {
     throw new OutcomesError(`--outcomes ${file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
   }
-  // Some editors and Windows tools start a UTF-8 file with a byte order mark.
-  if (text.startsWith("\uFEFF")) text = text.slice(1);
   const bad = (line: number, why: string) => new OutcomesError(`--outcomes ${file}, line ${line}: ${why}`);
   const rows = new Map<string, boolean>();
   const lineOf = new Map<string, number>();

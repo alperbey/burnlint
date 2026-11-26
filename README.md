@@ -98,7 +98,7 @@ A cheaper run that does the work worse isn't cheaper. burnlint doesn't judge out
 {"run": "69227109187db8b6eb5277e875078c69", "pass": false, "score": 0.4, "notes": "..."}
 ```
 
-`run` is the run's OTLP trace id (hex, or base64 as some exporters write it: standard or URL-safe, padded or not) or its Claude Code session id. `pass` is `true` or `false`. Other keys are ignored and never printed. A line that can't be read, or a run listed both as pass and fail, is refused with its line number; a file none of whose ids match a run exits 2 (usually the wrong file or the wrong id).
+`run` is the run's OTLP trace id (hex, or base64 as some exporters write it, padded or not, standard or URL-safe) or its Claude Code session id. `pass` is `true` or `false`. Other keys are ignored and never printed. A line that can't be read, or a run listed both as pass and fail, is refused with its line number; a file none of whose ids match a run exits 2 (usually the wrong file or the wrong id).
 
 What counts as a failure is yours to decide, but one rule keeps the numbers honest: **`false` when your agent ran and didn't deliver, for any reason of its own** (a wrong answer, its turn limit, its cost cap, a response cut off at its output limit); **no row only when you couldn't grade it or something outside the agent broke** (a provider outage, a rate limit, the harness). A run with no row is unknown, never a failure. Leaving out the runs that hit their own limits drops the likeliest and often most expensive failures.
 
@@ -132,7 +132,7 @@ If any compared run has no outcome, both the success and the cost-per-success ve
 
 **Few runs can only show a collapse.** Pass/fail carries little information per run. In a single group of 3 runs, no drop is ever clear, not even 3/3 → 0/3. In one group of 5, 5/5 → 1/5 is; 5/5 → 2/5 isn't. Groups add up: 2 tasks × 3 runs show 6/6 → 1/6, 3 tasks × 5 runs show 15/15 → 10/15. These are for the CI gate (one-sided p < 0.05); without `--fail-success-drop`, the verdict is two-sided and needs a little more. The test is much stronger when each input is its own group (`--group-by` with an input id on the root span): it then works like a sign test. Five inputs that flip from pass to fail, with none flipping back, fail the gate (p = 1/32); without the gate, the verdict calls it clear from six.
 
-**CI.** `--fail-success-drop <points>` exits 1 when the success rate fell more than that many percentage points and the runs show a drop clearly (one-sided p < 0.05). A drop the runs can't show prints a warning and passes; a compared run with no outcome exits 2. Success counts runs with no priced call too, so a head whose every run failed early still fails this gate, even though its cost can't be compared. It is separate from `--fail-above`, which stays about cost; with both set, either can fail the build. Without the success gate, a drop in success is still written to stderr, so a green cost check doesn't hide it.
+**CI.** `--fail-success-drop <points>` exits 1 when the success rate fell more than that many percentage points and the runs show a drop clearly (one-sided p < 0.05). A drop the runs can't show prints a warning and passes; a compared run with no outcome exits 2. The gate runs even when cost can't be compared (a head whose runs all failed before a priced call): a clear drop still exits 1. It is separate from `--fail-above`, which stays about cost; with both set, either can fail the build. Without the success gate, a drop in success is still written to stderr, so a green cost check doesn't hide it.
 
 ## Recording a running agent
 
@@ -276,7 +276,9 @@ OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=10000 \
 
 v0.4. Working: Claude Code logs, gen_ai OTLP, Vercel AI SDK 7 (both span formats; Anthropic, DeepSeek and Gemini providers checked), OpenAI Agents SDK via OpenInference, four rules, cost per run, `diff` for before/after cost per run with a CI gate, outcomes from your own pass/fail file (success rate and cost per successful run, success and cost per success compared in `diff`, `--fail-success-drop`), table / JSON / Markdown output, `record` for OTLP/HTTP (protobuf or JSON).
 
-New in 0.4: a verdict on cost per success in `diff`; JSON `success.costPerSuccess` gains `change`, `pHigher`, `pTwoSided`, `minP`, `method`, `permutations` and `verdict`. Run ids carry the full trace id; outcomes files accept URL-safe and unpadded base64 ids and a byte order mark; a head whose every run failed early now fails `--fail-success-drop`.
+New in 0.4: a verdict on cost per success in `diff`; JSON `success.costPerSuccess` gains `change`, `pHigher`, `pTwoSided`, `minP`, `method`, `permutations` and `verdict`. Base64 run ids in outcomes files must be a valid encoding of a 16-byte trace id (0.3.1 read any 22 base64 characters as one, rewriting some names); a group with no priced run on one side shows its passes in the table, with `–` for cost.
+
+0.3.1: runs whose trace ids share their first 12 hex digits stay separate; the success gate runs when cost can't be compared; a group with no priced run on one side is named with its passes; more base64 id forms and a byte-order mark in outcomes files.
 
 New in 0.3: `--outcomes` on `audit` and `diff`, `--fail-success-drop`, and `--group-by` on a key whose name looks like content (`bench.input_id`). JSON output gains `outcomes` (audit), `success` (diff), and `traceId` and `pass` on runs.
 

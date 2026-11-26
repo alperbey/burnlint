@@ -178,6 +178,12 @@ export function readOtlp(file: string, opts: ReadOptions = {}): Run[] {
     if (badLines) run.notes.push(`${badLines} unparseable line(s) skipped`);
     if (run.turns.length) runs.push(run);
   }
+  // A run id is short (12 hex of the trace id), which is unique for random ids but
+  // not for ids that start with a timestamp. Traces that would share one get the
+  // whole trace id, so they stay separate runs (with their own outcome).
+  const seen = new Map<string, number>();
+  for (const r of runs) seen.set(r.id, (seen.get(r.id) ?? 0) + 1);
+  for (const r of runs) if (seen.get(r.id)! > 1) r.id = `${basename(file)}#${r.traceId}`;
   return runs;
 }
 
@@ -352,7 +358,7 @@ function buildRun(list: Span[], file: string, traceId: string, allowLabels: Set<
 
   const service = list.find((s) => s.service)?.service;
   return {
-    id: `${basename(file)}#${traceId}`,
+    id: `${basename(file)}#${traceId.slice(0, 12)}`,
     traceId,
     source: "otlp",
     dialect: list.some((s) => openInferenceKind(s))

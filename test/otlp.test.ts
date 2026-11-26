@@ -28,7 +28,7 @@ test("real openai-v2 instrumentation trace: DeepSeek relabeled, cache unknown", 
   assert.equal(run!.turns[0]!.tools[0]!.target, "src/app.py");
   assert.match(run!.notes.join("\n"), /upper bound/);
   // base64 ids from the protobuf JSON mapping are normalized to hex
-  assert.match(run!.id, /#[0-9a-f]{32}$/);
+  assert.match(run!.id, /#[0-9a-f]{12}$/);
 });
 
 test("cache attributes are subtracted from total input", () => {
@@ -199,7 +199,7 @@ for (const [format, failedId] of [["legacy", "9cdd1c67f10a"], ["semconv", "e4983
     const runs = readOtlp(file);
     const price = new PriceTable().lookup("claude-sonnet-5-5")!;
     for (const run of runs) {
-      const id = run.id.split("#")[1]!.slice(0, 12);
+      const id = run.id.split("#")[1]!;
       assert.equal(run.dialect, format === "legacy" ? "ai-sdk" : "gen_ai");
       if (id === failedId) {
         assert.equal(run.turns.length, 1);
@@ -216,8 +216,8 @@ for (const [format, failedId] of [["legacy", "9cdd1c67f10a"], ["semconv", "e4983
       assert.ok(run.turns.some((t) => t.tools.some((x) => x.name === "read_file" && x.kind === "read" && x.resultTokens! > 0)));
     }
     const r = audit([file]);
-    for (const s of r.runs.filter((x) => !x.id.split("#")[1]!.startsWith(failedId))) {
-      const t = SDK_TOTALS[s.id.split("#")[1]!.slice(0, 12)]!;
+    for (const s of r.runs.filter((x) => !x.id.endsWith(failedId))) {
+      const t = SDK_TOTALS[s.id.split("#")[1]!]!;
       const want = ((t.input - t.read - t.write) * price.input! + t.read * price.cacheRead! + t.write * price.cacheWrite5m! + t.output * price.output!) / 1e6;
       assert.ok(Math.abs(s.costUsd - want) < 1e-9, `${s.id}: ${s.costUsd} vs ${want}`);
     }
@@ -232,7 +232,7 @@ for (const [format, failedId] of [["legacy", "9cdd1c67f10a"], ["semconv", "e4983
     const rate = price.cacheWrite5m! - price.cacheRead!;
     for (const run of readOtlp(file)) {
       const findings = r.findings.filter((f) => f.runId === run.id);
-      const busted = SDK_TOTALS[run.id.split("#")[1]!.slice(0, 12)]?.read === 0;
+      const busted = SDK_TOTALS[run.id.split("#")[1]!]?.read === 0;
       assert.deepEqual(findings.map((f) => f.rule), busted ? ["cache-thrash"] : [], run.id);
       if (!busted) continue;
       // Each call would have read what the previous call cached; skip the reset and tiny losses.
@@ -261,15 +261,15 @@ test("real AI SDK 7 capture (reread): overlapping rereads found, a range boundar
   const r = audit([file]);
   const price = new PriceTable().lookup("claude-sonnet-5-5")!;
   for (const s of r.runs) {
-    const t = sdk[s.id.split("#")[1]!.slice(0, 12)]!;
+    const t = sdk[s.id.split("#")[1]!]!;
     const want = ((t.input - t.read - t.write) * price.input! + t.read * price.cacheRead! + t.write * price.cacheWrite5m! + t.output * price.output!) / 1e6;
     assert.ok(Math.abs(s.costUsd - want) < 1e-9, `${s.id}: ${s.costUsd} vs ${want}`);
   }
-  assert.deepEqual(r.findings.filter((f) => f.runId.includes(`#${NORMAL}`)), []);
+  assert.deepEqual(r.findings.filter((f) => f.runId.endsWith(NORMAL)), []);
 
   // Independent of the rule's line comparison: overlap of the requested ranges, per path.
   // A read without a range covers the lines it returned.
-  const run = readOtlp(file).find((x) => x.id.includes(`#${RERUN}`))!;
+  const run = readOtlp(file).find((x) => x.id.endsWith(RERUN))!;
   const seen = new Map<string, Array<[number, number]>>();
   const want = new Map<string, number>();
   for (const turn of run.turns)

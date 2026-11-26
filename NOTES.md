@@ -66,9 +66,17 @@ Independent review by Fable 5.2 of b723afe..b21e003 (read-only, ran its own inpu
 - The pass-and-fail conflict error echoed the run id from the user's file. Now names line numbers only.
 - Equal rates summed in another order (3,2,1 -> 2,2,2 of 3) gave change -1.1e-16: "head passed less often (6/9 -> 6/9)". A change under 1e-12 is now 0.
 - "on those 1 ÷ 0 passes" now reads "0 of 1 run passed (0.0%) · $0.12 spent on it".
-Deferred to 0.3.1 (CLAUDE.md roadmap): run id merging on a shared 12-hex prefix, the early exit 2 before the success gate, more base64 forms and a BOM. All four fixed on branch `fix-0.3.1` (2026-11-24); see below.
+Deferred to 0.3.1 (CLAUDE.md roadmap): run id merging on a shared 12-hex prefix, the early exit 2 before the success gate, more base64 forms and a BOM.
 
 Published `burnlint@0.3.0` (Alper, `npm publish --auth-type=web`, 2026-11-15) from 71c6520: registry `dist.shasum` 2e566e99695a9c4ffbc360bfbd77236fc9029724 equals the local `npm pack`; `latest` = 0.3.0; a fresh install from the registry runs `audit --outcomes` on the fixtures. Tag `v0.3.0`.
+
+## 0.3.1 (2026-11-15)
+
+The four items deferred from the 0.3.0 review, each with a test that fails on 0.3.0:
+- Run ids: `file#` + 12 hex of the trace id, unless another trace in the file shares those 12 hex; then both get the whole trace id. Normal output is unchanged. Display labels still show 8 characters, so such runs look alike in the table but are counted apart.
+- `diff` no longer returns 2 before the gates when a side has no priced run or no group has priced runs on both sides: that adds exit 2 ("cost per run not compared" with outcomes, "nothing to compare" without), and the success gate still runs, so a head whose runs all failed before a priced call exits 1 on a clear drop.
+- A group with runs on both sides but no priced run on one was listed as "only in base, not compared" although success compares it; now named with its passes ("b: no priced run in head, so cost leaves it out; success compares it: passed 3/3 → 0/3").
+- Outcomes files: base64 run ids unpadded or URL-safe (22 characters) are decoded like padded ones; a leading UTF-8 BOM is skipped.
 
 ## DeepSeek and Gemini on the AI SDK bench (2026-11-15)
 
@@ -90,9 +98,9 @@ Real captures from agent frameworks builders use (OpenAI Agents SDK, LangGraph, 
 
 Verdict: good progress; the measurement core (cost per run, `diff`) is solid, recent effort leaned too far into waste-rule polish, and the biggest risk is that nobody outside has used it. Fixed after it: `diff` exits 2 when no group has runs on both sides; "too few runs" suggests `--group-by` for a single group; the gate's semantics are documented (it tests a rise, not a rise above the threshold); a redacted real Claude Code fixture (`fixtures/claude-code-session.jsonl`, scratch session, Opus 5.5, 44 calls) with cost and cache-thrash checked against official prices; unit grouping shared between `audit` and `diff`; this log moved out of CLAUDE.md. Suggested order: publish 0.1, protobuf in `record`, a second builder framework (OpenAI Agents SDK or LangGraph via OpenInference), then outcomes; defer new rules until a real user's trace shows money there.
 
-## 0.3.1 fixes and the cost-per-success verdict (2026-11-24, branch `fix-0.3.1`)
+## Cost-per-success verdict (2026-11-24, branch `fix-0.3.1`)
 
-The four deferred fixes: run ids carry the full trace id; `diff` runs the success gate even when a side has no priced run (a head whose every run failed early exits 1 under `--fail-success-drop`, with `–` rows in the table); outcomes accept URL-safe and unpadded base64 (only canonical 16-byte encodings, so `nightly-run-2026-11-24` stays a name) and a UTF-8 BOM. Two notes fixed while rendering the collapse case ("only in base, not compared" now says cost; no "models: head ?").
+The branch first redid the four 0.3.1 fixes, not knowing 0.3.1 had been published on 2026-11-16 from a commit (5c5cc96) that stayed on the other computer until 2026-11-26. Merged onto it (2026-11-26), keeping: 0.3.1's run ids (12 hex unless they collide: published, and output unchanged for everyone else) and its notes and messages; the branch's stricter base64 check (only canonical 16-byte encodings: 0.3.1 read any 22 base64 characters as an id, so a name like `nightly-run-2026-11-24` was rewritten to hex); the branch's `–` rows for a group with no priced run on one side, beside 0.3.1's note naming its passes. No `v0.3.1` tag existed; 0.3.1's registry `dist.shasum` is 230e00160e3a565f2b6e6288dde1f582d3c4ea5d.
 
 Cost per success gets a verdict in `diff` (design check with Alper: verdict only, no gate; a failed call's unknown spend flags a lower bound instead of `can't tell`). Statistic log(head / base) at base's mix, runs relabeled within groups with cost and outcome together, exact over the four weighted sums up to 200k relabelings. Checks: p equals a brute-force count over all 63,504 relabelings of 2 groups x 5 v 5, written separately in the test; A/A over all 8,000 3v3 splits of the 18 same-setup ai-sdk runs (ai-sdk-3 normal + ai-sdk-7, all passed, so this checks the ratio on real costs, not on real failures): 4.97% called a change at p < 0.05. Still to do on the other computer: the same A/A on `captures/agents-2.jsonl` and `deepseek-1.jsonl` (they have failures). The README outcomes example is now ai-sdk-3 normal vs reread with the bench's grades (18/18 passed; per success $0.081 -> $0.111, +38%, equal to cost per run as it should be), replacing the OpenAI Agents prefix example whose capture is on the other computer. p-values between 0.045 and 0.055 now print three decimals (a clear 0.0496 had printed as p=0.05).
 

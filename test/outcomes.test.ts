@@ -22,6 +22,17 @@ const CUT_OFF = "69227109187db8b6eb5277e875078c69";
 
 // --- the file ------------------------------------------------------------------
 
+test("outcomes file: base64 trace ids match padded or not, standard or URL-safe; a BOM is skipped", () => {
+  // 0xfb 0xef 0xbe is "++++" in base64, "----" URL-safe.
+  const hex = "fbefbe".repeat(5) + "fb";
+  const std = Buffer.from(hex, "hex").toString("base64");
+  assert.match(std, /\+/);
+  for (const id of [std, std.replace(/=+$/, ""), std.replace(/\+/g, "-").replace(/\//g, "_"), std.replace(/\+/g, "-").replace(/=+$/, "")])
+    assert.equal(normalizeRunId(id), hex, id);
+  const o = readOutcomes(tmpFile("o.jsonl", `﻿{"run": "${hex}", "pass": true}\n`));
+  assert.deepEqual([...o.rows], [[hex, true]]);
+});
+
 test("outcomes file: ids normalized (hex any case, base64 trace ids, UUIDs), extra keys ignored", () => {
   const b64 = Buffer.from(EXPLAIN[0]!, "hex").toString("base64");
   const o = readOutcomes(
@@ -328,6 +339,51 @@ test("cli: --fail-success-drop exits 1 on a clear drop; with both gates, a failu
   assert.equal(cant.status, 2, cant.stderr);
 });
 
+test("cli: a head whose runs all failed before a priced call still fails the success gate (1, not 2)", () => {
+  const base = inputsFile("a", [1000, 1000, 1000, 1000, 1000]);
+  // Each head run: one model call that errored, no usage.
+  const failed = traceIds("b", 5).map((trace, i) => ({
+    ...span({ id: "1", name: "chat", start: 0, trace, attrs: { "gen_ai.operation.name": "chat", "gen_ai.provider.name": "anthropic", "gen_ai.request.model": "claude-sonnet-5-5", "bench.input_id": `q${i + 1}` } }),
+    status: { code: 2 },
+  }));
+  const head = tmpFile("b.json", JSON.stringify(otlp(failed)));
+  const rows = tmpFile("o.jsonl", jsonl([...traceIds("a", 5).map((run) => ({ run, pass: true })), ...traceIds("b", 5).map((run) => ({ run, pass: false }))]));
+  const out = run("diff", base, head, "--group-by", "bench.input_id", "--outcomes", rows, "--fail-success-drop", "10");
+  assert.equal(out.status, 1, out.stderr);
+  assert.match(out.stderr, /no priced runs in head .*; cost per run not compared/);
+  assert.match(out.stderr, /success fell 100\.0 points \(5\/5 -> 0\/5 passed\)/);
+  // Without outcomes it stays "nothing to compare", exit 2.
+  const plain = run("diff", base, head, "--group-by", "bench.input_id");
+  assert.equal(plain.status, 2);
+  assert.match(plain.stderr, /no priced runs in head .*; nothing to compare/);
+});
+
+test("diff: a group with no priced run on one side is named in the notes with its passes", () => {
+  const dead = (t: string) => unit(t, false, 0, { pricedCalls: 0, failedCalls: 1, calls: 1 });
+  const r = diffOf([...passes("a", true, true, true), ...passes("b", true, true, true)], [...passes("a", true, true, true), dead("b"), dead("b"), dead("b")]);
+  assert.deepEqual(r.onlyBase, ["b"]);
+  const t = renderDiffTable(r, { width: 200 });
+  assert.match(t, /b: no priced run in head, so cost leaves it out; success compares it: passed 3\/3 → 0\/3/);
+  assert.doesNotMatch(t, /only in base, not compared/);
+});
+
+test("audit: traces sharing the first 12 hex of their id stay separate runs, each with its outcome", () => {
+  const mk = (trace: string) =>
+    span({ id: "1", name: "chat", start: 0, trace, attrs: { "gen_ai.operation.name": "chat", "gen_ai.provider.name": "anthropic", "gen_ai.request.model": "claude-sonnet-5-5", "gen_ai.usage.input_tokens": 1000, "gen_ai.usage.output_tokens": 1 } });
+  // Time-prefixed ids: same first 12 hex, different after.
+  const ids = ["0190f3a1b2c3" + "1".repeat(20), "0190f3a1b2c3" + "2".repeat(20), "7".repeat(32)];
+  const file = tmpFile("t.json", JSON.stringify(otlp(ids.map(mk))));
+  const rows = tmpFile("o.jsonl", jsonl([{ run: ids[0], pass: true }, { run: ids[1], pass: false }, { run: ids[2], pass: true }]));
+  const r = audit([file], { rules: false, outcomes: readOutcomes(rows) });
+  assert.equal(r.runs.length, 3);
+  assert.equal(new Set(r.runs.map((x) => x.id)).size, 3);
+  assert.deepEqual(r.runs.map((x) => x.pass), [true, false, true]);
+  assert.equal(r.outcomes!.known, 3);
+  assert.equal(r.outcomes!.passed, 2);
+  // A run whose 12 hex are its own keeps the short id.
+  assert.equal(r.runs[2]!.id, `t.json#${"7".repeat(12)}`);
+});
+
 
 test("cli: --outcomes on audit; a file naming no run here exits 2; a bad file exits 2 with its line", () => {
   const ok = run("audit", fixture("openai-agents-explain.jsonl"), "--outcomes", fixture("openai-agents-outcomes.jsonl"));
@@ -430,11 +486,11 @@ test("diff: a head whose every run failed before a priced call fails the success
   const r = run("diff", base, head, "--outcomes", outcomes, "--fail-success-drop", "10");
   // 4 of 4 -> 0 of 4: one-sided p = 1/C(8,4) = 1/70.
   assert.equal(r.status, 1, r.stderr);
-  assert.match(r.stderr, /no priced runs in head .*cost not compared/);
+  assert.match(r.stderr, /no priced runs in head .*cost per run not compared/);
   assert.match(r.stderr, /success fell 100\.0 points \(4\/4 -> 0\/4 passed\)/);
   assert.match(r.stdout, /reviewer\s+base\s+4(\s+–){8}\s+4\/4/);
   assert.match(r.stdout, /head\s+4(\s+–){8}\s+0\/4/);
-  assert.match(r.stdout, /priced runs only in base, cost not compared: reviewer \(success compared\)/);
+  assert.match(r.stdout, /reviewer: no priced run in head, so cost leaves it out; success compares it: passed 4\/4 → 0\/4/);
   assert.doesNotMatch(r.stdout, /models:/);
   // Without the success gate, nothing was compared: 2.
   assert.equal(run("diff", base, head, "--outcomes", outcomes).status, 2);

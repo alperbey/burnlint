@@ -254,15 +254,16 @@ function runDiff(
     );
 
   // Both gates report; a clear failure of either wins over the other's "can't decide".
-  // Cost can't be compared without priced runs on both sides, but success can:
-  // a head whose every run failed before a priced call is the clearest drop.
   const codes: number[] = [];
-  const noPriced = ([["base", result.base], ["head", result.head]] as const).find(([, side]) => !side.counted);
-  if (noPriced) {
-    err(`burnlint: no priced runs in ${noPriced[0]} (${noPriced[1].paths.join(", ")}); cost not compared`);
+  // No cost to compare is exit 2, but success may still be compared (a head
+  // whose runs all failed before a priced call is the clearest drop of all).
+  const notCompared = result.success ? "cost per run not compared" : "nothing to compare";
+  const empty = (["base", "head"] as const).find((name) => !result[name].counted);
+  if (empty) {
+    err(`burnlint: no priced runs in ${empty} (${result[empty].paths.join(", ")}); ${notCompared}`);
     codes.push(2);
   } else if (!result.overall) {
-    err(`burnlint: no group has priced runs on both sides; cost not compared`);
+    err(`burnlint: no group has priced runs on both sides; ${notCompared}`);
     codes.push(2);
   } else if (failAbove !== undefined) {
     const g = gate(result, failAbove);
