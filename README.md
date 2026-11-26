@@ -47,14 +47,20 @@ npx burnlint diff base/ head/ --outcomes outcomes.jsonl  # ...and do they still 
 
 burnlint ships an agent skill, so Claude Code, Codex and other agents know when to run it and how to read its output. The skill runs the CLI with `npx burnlint`; nothing else is installed.
 
-Claude Code, as a plugin:
+Claude Code, as a plugin (2.1.275 or later):
+
+```
+/plugin install burnlint --marketplace alperbey/burnlint
+```
+
+On older versions, run these one at a time:
 
 ```
 /plugin marketplace add alperbey/burnlint
+```
+```
 /plugin install burnlint@burnlint
 ```
-
-(On Claude Code 2.1.275 or later, `/plugin install burnlint --marketplace alperbey/burnlint` does both.)
 
 Codex, or any agent that reads skills from `~/.agents/skills`:
 

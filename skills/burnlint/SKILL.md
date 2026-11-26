@@ -20,6 +20,8 @@ burnlint reads agent traces and reports cost per run, before/after changes with 
 | A CI check | `audit --fail-on high`, `diff --fail-above <pct>`, `diff --fail-success-drop <points>` |
 | Traces from their own agent | `npx burnlint record -o run.jsonl`, then run the agent with `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` |
 
+Claude Code keeps one folder per project in `~/.claude/projects/`, named after the project's path with `/`, spaces and other punctuation turned into `-`, for example `-Users-me-projects-app`. Each session is `<session-id>.jsonl`, with its sub-agents in `<session-id>/subagents/`. For "this project" audit that folder. For one session, pass both: `npx burnlint audit <session-id>.jsonl <session-id>/` (one run, sub-agents included; other files there are skipped). "My last session" is the newest `.jsonl` (`ls -t`), which may be the session you are running in.
+
 Output formats: `audit` takes `-f table|json|md` (md for PR comments); `diff` takes `-f table|json`. Run `npx burnlint --help` for every option.
 
 Inputs: Claude Code session logs, OTLP/JSON traces with GenAI (`gen_ai.*`), Vercel AI SDK (`ai.*`) or OpenInference spans, and files written by `burnlint record`. An agent whose exporter defaults to gRPC needs `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` for `record`.
@@ -54,6 +56,9 @@ Exit codes: 0 pass, 1 a `--fail-on`, `--fail-above` or `--fail-success-drop` gat
 JSONL, one line per run: `{"run": "<trace id or Claude Code session id>", "pass": true}`. burnlint never grades output. Use `false` when the agent ran and didn't deliver (wrong answer, turn limit, cut off); leave the run out when nobody could grade it.
 
 ## Notes
+
+- Costs are at API list prices. On a Claude subscription (Pro, Max, Team), the user isn't billed per token: say so when reporting Claude Code costs.
+- `cache-thrash` savings for an expired cache assume a keep-alive (re-sending the cached prefix before it expires). Claude Code users can't switch that on, so for them the practical fixes are starting a fresh session for a new topic, or `/compact` before a long break. Don't present the keep-alive saving as money they can collect as is.
 
 - Prices come from a bundled LiteLLM table; `--prices <file.json>` overrides them. Costs are estimates.
 - While the version is 0.x, `-f json` fields may change between minor versions.
