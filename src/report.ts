@@ -281,8 +281,13 @@ const signedPct = (x: number | null) => {
   const s = Math.abs(v) < 10 ? v.toFixed(1) : v.toFixed(0);
   return `${v >= 0 ? "+" : ""}${s}%`;
 };
-// Near the 0.05 line, two decimals would show a clear p=0.0496 as p=0.05: show three.
-const pValue = (p: number) => (p < 0.001 ? "p<0.001" : `p=${p.toFixed(p < 0.01 || (p >= 0.045 && p < 0.055) ? 3 : 2)}`);
+// Near the 0.05 line, two decimals would show a clear p=0.0496 as p=0.05: show three, and never
+// round a p under the line up to it (0.0495 is reachable: 396 of 8,000 relabelings).
+const pValue = (p: number) => {
+  if (p < 0.001) return "p<0.001";
+  const text = p.toFixed(p < 0.01 || (p >= 0.045 && p < 0.055) ? 3 : 2);
+  return p < SIGNIFICANCE && Number(text) >= SIGNIFICANCE ? `p<${SIGNIFICANCE}` : `p=${text}`;
+};
 
 export function renderDiffJson(r: DiffResult): string {
   return JSON.stringify(r, null, 2);
@@ -361,8 +366,11 @@ export function costPerSuccessLine(r: DiffResult): string {
   const s = r.success;
   if (!s) return "";
   const c = s.costPerSuccess;
-  const ch = c.change != null ? signedPct(c.change) : c.headUsd == null ? "head has no passes" : "base has no passes";
-  const p = pValue(c.pTwoSided);
+  // change is also null when base spent $0 with passes: that is not "no passes".
+  const ch =
+    c.change != null ? signedPct(c.change) : c.headUsd == null ? "head has no passes" : c.baseUsd == null ? "base has no passes" : "?";
+  // Under --fail-above the cost line is one-sided; say that this one isn't, so the two don't seem to disagree.
+  const p = (r.overall?.test === "rise" ? "two-sided " : "") + pValue(c.pTwoSided);
   switch (c.verdict) {
     case "higher":
       return `higher, ${ch} (${p})`;
@@ -428,7 +436,7 @@ export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): st
       const lead = `  per success   ${each(cps.baseUsd)} → ${each(cps.headUsd)}   `;
       hanging(lead, costPerSuccessLine(r), opts.width).forEach((l, i) => out.push(i ? l : lead + c(ccolor, l.slice(lead.length))));
       const note = ["all spend on runs with an outcome ÷ passes, failed runs included"];
-      if (cps.lowerBound) note.push("lower bound: some runs had a failed call whose spend is unknown");
+      if (cps.lowerBound) note.push("lower bound: some runs have calls whose spend is unknown (failed, or without a price or usage)");
       out.push(...hanging(" ".repeat(16), note.join(" · "), opts.width).map(dim));
     }
   }

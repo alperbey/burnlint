@@ -31,8 +31,8 @@ export function normalizeRunId(id: string): string {
   if (/^[0-9a-f]{32}$/i.test(s)) return s.toLowerCase();
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return s.toLowerCase();
   // 16 bytes in base64: 22 characters, then "==" or nothing; standard or
-  // URL-safe alphabet. The last character carries 2 unused bits that a
-  // canonical encoder leaves zero, so a 22-character name rarely passes.
+  // URL-safe alphabet. The last character carries 4 unused bits that a
+  // canonical encoder leaves zero, so 1 in 16 22-character names passes.
   if (/^[A-Za-z0-9+/_-]{21}[AQgw](==)?$/.test(s) && !(/[+/]/.test(s) && /[-_]/.test(s))) return hexId(s);
   return s;
 }

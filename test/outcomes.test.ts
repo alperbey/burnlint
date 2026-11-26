@@ -532,5 +532,34 @@ test("diff: cost per success is can't tell with unknown spend or a missing outco
   const cps = r3.success!.costPerSuccess;
   assert.equal(cps.lowerBound, true);
   assert.notEqual(cps.verdict, "can't tell");
-  assert.match(renderDiffTable(r3, { width: 200 }), /lower bound: some runs had a failed call/);
+  assert.match(renderDiffTable(r3, { width: 200 }), /lower bound: some runs have calls whose spend is unknown/);
+});
+
+test("diff: a clear p just under 0.05 never prints as p=0.050 (review repro: 396 of 8,000)", () => {
+  const costs = {
+    base: [[1.4541, 1.1015, 1.5044], [1.2054, 1.8874, 1.7986], [1.2137, 1.6314, 1.8821]],
+    head: [[1.501, 2.0337, 1.9305], [1.9402, 1.6783, 1.5401], [1.8571, 1.865, 1.744]],
+  };
+  const side = (cs: number[][]) => cs.flatMap((g, i) => g.map((c) => unit(`t${i}`, true, c)));
+  const r = diffOf(side(costs.base), side(costs.head));
+  close(r.success!.costPerSuccess.pTwoSided, 396 / 8000);
+  assert.equal(r.success!.costPerSuccess.verdict, "higher");
+  assert.match(costPerSuccessLine(r), /\(p<0\.05\)$/);
+  const t = renderDiffTable(r, { width: 200 });
+  assert.doesNotMatch(t, /p=0\.050/);
+});
+
+test("diff: base spending $0 with passes is not \"no passes\"", () => {
+  const r = diffOf(passes("a", true, true, true, true, true).map((u) => ({ ...u, costUsd: 0 })), passes("a", true, true, true, true, true));
+  assert.equal(r.success!.costPerSuccess.baseUsd, 0);
+  assert.doesNotMatch(costPerSuccessLine(r), /no passes/);
+});
+
+test("diff: under --fail-above the per-success line says its p is two-sided", () => {
+  const base = passes("a", true, true, true, true, true);
+  const head = [true, true, true, true, true].map((p) => unit("a", p, 2));
+  const o = rowsOf(...base, ...head);
+  const r = compare(base, head, { groupBy: "task", outcomes: o, test: "rise" });
+  assert.match(costPerSuccessLine(r), /two-sided p=/);
+  assert.doesNotMatch(costPerSuccessLine(diffOf(base, head)), /two-sided/);
 });

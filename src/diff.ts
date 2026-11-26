@@ -83,7 +83,7 @@ export interface CostPerSuccess {
   /** null with no passes. */
   baseUsd: number | null;
   headUsd: number | null;
-  /** Some runs with an outcome had a failed call: spend it may have cost is missing, so both figures are lower bounds. */
+  /** Some runs with an outcome have calls whose spend is unknown (a failed call, or no price or usage): both figures are lower bounds. */
   lowerBound: boolean;
   /** headUsd / baseUsd - 1; null when either side has no passes. */
   change: number | null;
