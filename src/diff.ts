@@ -61,7 +61,7 @@ export interface SuccessDiff {
    * Spend per pass at base's mix: everything spent on runs with an outcome,
    * failed runs included, divided by the passes. null with no passes.
    */
-  costPerSuccess: { baseUsd: number | null; headUsd: number | null; lowerBound: boolean };
+  costPerSuccess: CostPerSuccess;
   test: DiffTest;
   /** One-sided p that head passes less often; two-sided p for any change. */
   pDrop: number;
@@ -70,6 +70,33 @@ export interface SuccessDiff {
   method: "exact" | "sampled";
   permutations: number;
   /** "lower" means head succeeds less often. "can't tell" when a compared run has no outcome. */
+  verdict: Verdict;
+}
+
+/**
+ * Spend per pass before and after, and a permutation test of the ratio: runs
+ * are relabeled within groups with their cost and outcome together, and
+ * log(head / base) is computed each time. No passes on a side is an infinite
+ * cost per success. Always two-sided: no gate uses it yet.
+ */
+export interface CostPerSuccess {
+  /** null with no passes. */
+  baseUsd: number | null;
+  headUsd: number | null;
+  /** Some runs with an outcome had a failed call: spend it may have cost is missing, so both figures are lower bounds. */
+  lowerBound: boolean;
+  /** headUsd / baseUsd - 1; null when either side has no passes. */
+  change: number | null;
+  pHigher: number;
+  pTwoSided: number;
+  minP: number;
+  method: "exact" | "sampled";
+  permutations: number;
+  /**
+   * "higher" means a success costs more in head. "can't tell" when success
+   * can't tell, or a compared run with an outcome has calls with no price or
+   * no usage (its spend is unknown).
+   */
   verdict: Verdict;
 }
 
@@ -440,11 +467,19 @@ function success(base: Unit[], head: Unit[], o: Outcomes, test: DiffTest = "two-
     baseRate,
     headRate,
     change,
-    costPerSuccess: {
-      baseUsd: perSuccess(base),
-      headUsd: perSuccess(head),
-      lowerBound: known(compared).some((u) => u.failed || u.unpriced),
-    },
+    costPerSuccess: costPerSuccess(
+      perSuccess(base),
+      perSuccess(head),
+      rated
+        ? groups.map((g) => ({
+            weight: g.weight,
+            base: known(inGroup(base, g.name)).map((u): Pair => [u.cost, u.pass ? 1 : 0]),
+            head: known(inGroup(head, g.name)).map((u): Pair => [u.cost, u.pass ? 1 : 0]),
+          }))
+        : [],
+      verdict === "can't tell" || known(compared).some((u) => u.unpriced),
+      known(compared).some((u) => u.failed || u.unpriced),
+    ),
     test,
     pDrop: t?.pHigher ?? 1,
     pTwoSided: t?.pTwoSided ?? 1,
@@ -453,6 +488,125 @@ function success(base: Unit[], head: Unit[], o: Outcomes, test: DiffTest = "two-
     permutations: t?.permutations ?? 0,
     verdict,
   };
+}
+
+/** A run's cost and whether it passed (1) or not (0). */
+type Pair = [number, number];
+
+interface PairSample {
+  weight: number;
+  base: Pair[];
+  head: Pair[];
+}
+
+/** Weighted means of spend and passes: [head spend, base spend, head passes, base passes]. */
+type Sums = [number, number, number, number];
+
+/** log(cost per success), with no passes as +Infinity (and no spend with passes as -Infinity). */
+const logPerSuccess = (spend: number, passes: number) => (passes > 0 ? Math.log(spend / passes) : Infinity);
+
+/** log(head / base) of cost per success. Both sides without passes can't happen while any run passed; 0 then. */
+const ratioStatistic = (s: Sums) => {
+  const v = logPerSuccess(s[0], s[2]) - logPerSuccess(s[1], s[3]);
+  return Number.isNaN(v) ? 0 : v;
+};
+
+const sumsOf = (gs: PairSample[]): Sums => {
+  const t: Sums = [0, 0, 0, 0];
+  for (const g of gs) {
+    const mean = (xs: Pair[], i: 0 | 1) => xs.reduce((s, x) => s + x[i], 0) / xs.length;
+    t[0] += g.weight * mean(g.head, 0);
+    t[1] += g.weight * mean(g.base, 0);
+    t[2] += g.weight * mean(g.head, 1);
+    t[3] += g.weight * mean(g.base, 1);
+  }
+  return t;
+};
+
+function costPerSuccess(
+  baseUsd: number | null,
+  headUsd: number | null,
+  gs: PairSample[],
+  cantTell: boolean,
+  lowerBound: boolean,
+): CostPerSuccess {
+  const change = baseUsd != null && headUsd != null && baseUsd > 0 ? headUsd / baseUsd - 1 : null;
+  const none = { pHigher: 1, pTwoSided: 1, minP: 1, method: "exact" as const, permutations: 0 };
+  // No pass on either side: there is no cost per success to compare.
+  if (!gs.length || (baseUsd == null && headUsd == null)) return { baseUsd, headUsd, lowerBound, change, ...none, verdict: "can't tell" };
+  const observed = ratioStatistic(sumsOf(gs));
+  const { values, method } = pairDistribution(gs);
+  // On the log scale, so a fixed tolerance: ties summed in another order, and infinities compared as they are.
+  const eps = 1e-9;
+  const higher = values.filter((v) => v >= observed - eps).length;
+  const either = values.filter((v) => Math.abs(v) >= Math.abs(observed) - eps).length;
+  const p = (hits: number) => (method === "exact" ? hits / values.length : (hits + 1) / (values.length + 1));
+  const most = values.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  const minP = method === "exact" ? values.filter((v) => Math.abs(v) >= most - eps).length / values.length : 1 / (SAMPLES + 1);
+  const pTwoSided = p(either);
+  let verdict: Verdict;
+  if (cantTell) verdict = "can't tell";
+  else if (Math.abs(observed) < eps) verdict = "no clear change";
+  else if (minP >= SIGNIFICANCE) verdict = "too few runs";
+  else if (pTwoSided < SIGNIFICANCE) verdict = observed > 0 ? "higher" : "lower";
+  else verdict = "no clear change";
+  return {
+    baseUsd,
+    headUsd,
+    lowerBound,
+    change,
+    pHigher: p(higher),
+    pTwoSided,
+    minP,
+    method,
+    permutations: method === "exact" ? values.length : SAMPLES,
+    verdict,
+  };
+}
+
+/**
+ * The ratio statistic over relabelings within groups, each run keeping its
+ * cost and outcome together. Exact up to EXACT_LIMIT relabelings (the four
+ * weighted sums add up across groups), else SAMPLES with the same fixed seed.
+ */
+function pairDistribution(gs: PairSample[]): { values: number[]; method: "exact" | "sampled" } {
+  let count = 1;
+  for (const g of gs) {
+    count *= binomial(g.base.length + g.head.length, g.head.length);
+    if (count > EXACT_LIMIT) break;
+  }
+  if (count <= EXACT_LIMIT) {
+    let sums: Sums[] = [[0, 0, 0, 0]];
+    for (const g of gs) {
+      const pool = [...g.base, ...g.head];
+      const total = pool.reduce<Pair>((s, x) => [s[0] + x[0], s[1] + x[1]], [0, 0]);
+      const k = g.head.length;
+      const m = pool.length - k;
+      const parts: Sums[] = [];
+      for (const pick of combinations(pool.length, k)) {
+        const h = pick.reduce<Pair>((s, i) => [s[0] + pool[i]![0], s[1] + pool[i]![1]], [0, 0]);
+        parts.push([(g.weight * h[0]) / k, (g.weight * (total[0] - h[0])) / m, (g.weight * h[1]) / k, (g.weight * (total[1] - h[1])) / m]);
+      }
+      const next: Sums[] = [];
+      for (const s of sums) for (const q of parts) next.push([s[0] + q[0], s[1] + q[1], s[2] + q[2], s[3] + q[3]]);
+      sums = next;
+    }
+    return { values: sums.map(ratioStatistic), method: "exact" };
+  }
+  const random = mulberry32(0x6275726e);
+  const values: number[] = [];
+  for (let s = 0; s < SAMPLES; s++) {
+    const shuffled = gs.map((g) => {
+      const pool = [...g.base, ...g.head];
+      for (let i = pool.length - 1; i > 0; i--) {
+        const j = Math.floor(random() * (i + 1));
+        [pool[i], pool[j]] = [pool[j]!, pool[i]!];
+      }
+      return { weight: g.weight, head: pool.slice(0, g.head.length), base: pool.slice(g.head.length) };
+    });
+    values.push(ratioStatistic(sumsOf(shuffled)));
+  }
+  return { values, method: "sampled" };
 }
 
 /**

@@ -281,7 +281,8 @@ const signedPct = (x: number | null) => {
   const s = Math.abs(v) < 10 ? v.toFixed(1) : v.toFixed(0);
   return `${v >= 0 ? "+" : ""}${s}%`;
 };
-const pValue = (p: number) => (p < 0.001 ? "p<0.001" : `p=${p.toFixed(p < 0.01 ? 3 : 2)}`);
+// Near the 0.05 line, two decimals would show a clear p=0.0496 as p=0.05: show three.
+const pValue = (p: number) => (p < 0.001 ? "p<0.001" : `p=${p.toFixed(p < 0.01 || (p >= 0.045 && p < 0.055) ? 3 : 2)}`);
 
 export function renderDiffJson(r: DiffResult): string {
   return JSON.stringify(r, null, 2);
@@ -355,6 +356,29 @@ export function successVerdictLine(r: DiffResult): string {
   }
 }
 
+/** The cost-per-success verdict in one line (two-sided: no gate uses it). */
+export function costPerSuccessLine(r: DiffResult): string {
+  const s = r.success;
+  if (!s) return "";
+  const c = s.costPerSuccess;
+  const ch = c.change != null ? signedPct(c.change) : c.headUsd == null ? "head has no passes" : "base has no passes";
+  const p = pValue(c.pTwoSided);
+  switch (c.verdict) {
+    case "higher":
+      return `higher, ${ch} (${p})`;
+    case "lower":
+      return `lower, ${ch} (${p})`;
+    case "no clear change":
+      return c.change != null && Math.abs(c.change) < 1e-12 ? "no change" : `no clear change: ${ch}, not clearly beyond run-to-run noise (${p})`;
+    case "too few runs":
+      return `too few runs to tell (${ch}): no change these runs could show would reach p<${SIGNIFICANCE}`;
+    case "can't tell":
+      return s.verdict === "can't tell"
+        ? "can't tell: compared runs with no outcome"
+        : "can't tell: runs with an outcome have calls with no price or no usage, so their spend is unknown";
+  }
+}
+
 export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): string {
   const r = plainDeep(result);
   const c = (code: string, s: string) => (opts.color && s ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -395,18 +419,24 @@ export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): st
     const passed = (x: { known: number; passed: number; runs: number }) =>
       `${x.passed}/${x.known}${x.known < x.runs ? ` (${x.runs - x.known} without outcome)` : ""}`;
     const sub = [`passed ${passed(s.base)} → ${passed(s.head)}`];
-    const cps = s.costPerSuccess;
-    if (cps.baseUsd != null || cps.headUsd != null)
-      sub.push(
-        `per success ${cps.baseUsd == null ? "no passes" : usd(cps.baseUsd)} → ${cps.headUsd == null ? "no passes" : usd(cps.headUsd)}` +
-          ` (all spend on runs with an outcome, failed runs included${cps.lowerBound ? "; lower bound: some runs priced in part" : ""})`,
-      );
     if (s.groups.length > 1) sub.push("at base's mix of groups");
     out.push(...hanging(" ".repeat(16), sub.join(" · "), opts.width).map(dim));
+    const cps = s.costPerSuccess;
+    if (cps.baseUsd != null || cps.headUsd != null) {
+      const ccolor = cps.verdict === "higher" ? "1;31" : cps.verdict === "lower" ? "1;32" : "1";
+      const each = (x: number | null) => (x == null ? "no passes" : usd(x));
+      const lead = `  per success   ${each(cps.baseUsd)} → ${each(cps.headUsd)}   `;
+      hanging(lead, costPerSuccessLine(r), opts.width).forEach((l, i) => out.push(i ? l : lead + c(ccolor, l.slice(lead.length))));
+      const note = ["all spend on runs with an outcome ÷ passes, failed runs included"];
+      if (cps.lowerBound) note.push("lower bound: some runs had a failed call whose spend is unknown");
+      out.push(...hanging(" ".repeat(16), note.join(" · "), opts.width).map(dim));
+    }
   }
   out.push("");
 
-  if (r.groups.length) {
+  // Success counts every run: a group can have outcomes on both sides with no priced run on one.
+  const successOnly = (r.success?.groups ?? []).filter((g) => !r.groups.some((c) => c.name === g.name));
+  if (r.groups.length || successOnly.length) {
     const succ = new Map((r.success?.groups ?? []).map((g) => [g.name, g]));
     const head = ["group", "side", "runs", "mean", "median", "min", "max", "calls", "prompt tok", "output tok", "cache", ...(r.success ? ["passed"] : []), ""];
     const rows: string[][] = [];
@@ -429,6 +459,9 @@ export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): st
         ]);
       }
     }
+    for (const g of successOnly)
+      for (const side of ["base", "head"] as const)
+        rows.push([side === "base" ? g.name : "", side, String(g[side].runs), ...Array<string>(8).fill("–"), passedCell(g[side]), ""]);
     const w = head.map((h, i) => Math.max(h.length, ...rows.map((row) => row[i]!.length)));
     const left = (i: number) => i < 2;
     const line = (cells: string[]) => "  " + cells.map((s, i) => (left(i) ? s.padEnd(w[i]!) : s.padStart(w[i]!))).join("  ").trimEnd();
@@ -437,7 +470,8 @@ export function renderDiffTable(result: DiffResult, opts: TableOptions = {}): st
     out.push(
       dim(
         `  per run means; cache = cache reads as a share of prompt tokens` +
-          (r.success ? `; passed = passes of runs with an outcome, every run counted (also those with no priced call)` : ""),
+          (r.success ? `; passed = passes of runs with an outcome, every run counted (also those with no priced call)` : "") +
+          (successOnly.length ? `; – = no priced run on one side, cost not compared` : ""),
       ),
     );
     out.push("");
@@ -469,12 +503,17 @@ function diffNotes(r: DiffResult): string[] {
         (more ? `; and a failed run usually stops early, so head may look cheaper than it is` : ""),
     );
   }
-  if (b.models.join() !== h.models.join())
+  // Models come from priced runs: a side without any says nothing about a model change.
+  if (b.counted && h.counted && b.models.join() !== h.models.join())
     out.push(`models: base ${b.models.join(", ") || "?"}; head ${h.models.join(", ") || "?"}. A model change is a trade-off: ${r.success ? "weigh cost against success above" : "cost alone doesn't show whether the work still gets done; add --outcomes"}`);
   const unpriced = [...new Set([...b.unpricedModels, ...h.unpricedModels])];
   if (unpriced.length) out.push(`no price for model(s): ${unpriced.join(", ")} (add them with --prices)`);
   if (r.success?.unmatchedRows) out.push(`${plural(r.success.unmatchedRows, "row")} in ${short(r.success.file)} name no run on either side`);
-  if (r.onlyBase.length) out.push(`only in base, not compared: ${r.onlyBase.join(", ")}`);
-  if (r.onlyHead.length) out.push(`only in head, not compared: ${r.onlyHead.join(", ")}`);
+  // Success counts runs with no priced call, so it may still compare these groups.
+  const success = new Set((r.success?.groups ?? []).map((g) => g.name));
+  const only = (side: string, names: string[]) =>
+    `priced runs only in ${side}, cost not compared: ${names.map((n) => (success.has(n) ? `${n} (success compared)` : n)).join(", ")}`;
+  if (r.onlyBase.length) out.push(only("base", r.onlyBase));
+  if (r.onlyHead.length) out.push(only("head", r.onlyHead));
   return out;
 }

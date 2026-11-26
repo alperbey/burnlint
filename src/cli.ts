@@ -56,7 +56,7 @@ Diff:
                                  With 3 runs per group, only rises of 15-20% or more are reliably
                                  seen; use 5+ runs for 10%.
       --outcomes <file.jsonl>    Pass/fail per run, as for audit: adds success before and after,
-                                 tested like cost, and cost per successful run
+                                 tested like cost, and cost per successful run, with a verdict
       --fail-success-drop <pts>  Exit 1 if the success rate fell more than this many percentage
                                  points and the runs show a drop clearly (one-sided p < 0.05).
                                  Few runs can only show a collapse: one group of 3 runs never
@@ -253,19 +253,18 @@ function runDiff(
       }) + "\n",
     );
 
-  for (const [name, side] of [["base", result.base], ["head", result.head]] as const) {
-    if (!side.counted) {
-      err(`burnlint: no priced runs in ${name} (${side.paths.join(", ")}); nothing to compare`);
-      return 2;
-    }
-  }
-  if (!result.overall) {
-    err(`burnlint: no group has priced runs on both sides; nothing was compared`);
-    return 2;
-  }
   // Both gates report; a clear failure of either wins over the other's "can't decide".
+  // Cost can't be compared without priced runs on both sides, but success can:
+  // a head whose every run failed before a priced call is the clearest drop.
   const codes: number[] = [];
-  if (failAbove !== undefined) {
+  const noPriced = ([["base", result.base], ["head", result.head]] as const).find(([, side]) => !side.counted);
+  if (noPriced) {
+    err(`burnlint: no priced runs in ${noPriced[0]} (${noPriced[1].paths.join(", ")}); cost not compared`);
+    codes.push(2);
+  } else if (!result.overall) {
+    err(`burnlint: no group has priced runs on both sides; cost not compared`);
+    codes.push(2);
+  } else if (failAbove !== undefined) {
     const g = gate(result, failAbove);
     const ch = result.overall?.change;
     const rose = ch == null ? "" : `${(ch * 100).toFixed(1)}%`;

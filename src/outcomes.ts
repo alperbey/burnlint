@@ -30,8 +30,10 @@ export function normalizeRunId(id: string): string {
   const s = id.trim();
   if (/^[0-9a-f]{32}$/i.test(s)) return s.toLowerCase();
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return s.toLowerCase();
-  // 16 bytes in base64: 22 characters and "==".
-  if (/^[A-Za-z0-9+/]{22}==$/.test(s)) return hexId(s);
+  // 16 bytes in base64: 22 characters, then "==" or nothing; standard or
+  // URL-safe alphabet. The last character carries 2 unused bits that a
+  // canonical encoder leaves zero, so a 22-character name rarely passes.
+  if (/^[A-Za-z0-9+/_-]{21}[AQgw](==)?$/.test(s) && !(/[+/]/.test(s) && /[-_]/.test(s))) return hexId(s);
   return s;
 }
 
@@ -42,6 +44,8 @@ export function readOutcomes(file: string): Outcomes {
   } catch (e) {
     throw new OutcomesError(`--outcomes ${file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
   }
+  // Some editors and Windows tools start a UTF-8 file with a byte order mark.
+  if (text.startsWith("\uFEFF")) text = text.slice(1);
   const bad = (line: number, why: string) => new OutcomesError(`--outcomes ${file}, line ${line}: ${why}`);
   const rows = new Map<string, boolean>();
   const lineOf = new Map<string, number>();

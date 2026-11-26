@@ -352,7 +352,7 @@ function buildRun(list: Span[], file: string, traceId: string, allowLabels: Set<
 
   const service = list.find((s) => s.service)?.service;
   return {
-    id: `${basename(file)}#${traceId.slice(0, 12)}`,
+    id: `${basename(file)}#${traceId}`,
     traceId,
     source: "otlp",
     dialect: list.some((s) => openInferenceKind(s))

@@ -8,7 +8,7 @@ import { audit, type RunSummary } from "../src/audit.js";
 import { compare, successGate } from "../src/diff.js";
 import { normalizeRunId, OutcomesError, readOutcomes, type Outcomes } from "../src/outcomes.js";
 import { PriceTable } from "../src/pricing.js";
-import { renderDiffTable, renderTable, successVerdictLine } from "../src/report.js";
+import { costPerSuccessLine, renderDiffTable, renderTable, successVerdictLine } from "../src/report.js";
 import { jsonl, otlp, span, tmpFile } from "./helpers.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -39,6 +39,18 @@ test("outcomes file: ids normalized (hex any case, base64 trace ids, UUIDs), ext
     ["5f3c9a1e-0b7d-4c2e-9a61-2b8e4d0f7c13", false],
   ]);
   assert.equal(normalizeRunId(b64), EXPLAIN[0]);
+  // Unpadded and URL-safe base64, as some exporters and tools write ids.
+  const ids = ["7de20e3d2fe6c9a8f4a2b8b0c1d0f3ff", "fbff00ff7a5c3e1d0b2c4d6e8f9a1b2c"];
+  for (const hex of ids) {
+    const std = Buffer.from(hex, "hex").toString("base64");
+    const url = Buffer.from(hex, "hex").toString("base64url");
+    assert.equal(normalizeRunId(std.replace(/=+$/, "")), hex);
+    assert.equal(normalizeRunId(url), hex);
+    assert.equal(normalizeRunId(url + "=="), hex);
+  }
+  assert.match(Buffer.from(ids[1]!, "hex").toString("base64url"), /[-_]/);
+  // A 22-character name that isn't a canonical encoding of 16 bytes stays as written.
+  assert.equal(normalizeRunId("nightly-run-2026-11-24"), "nightly-run-2026-11-24");
   // Base64 is case-sensitive: only hex and UUIDs are case-folded.
   assert.equal(normalizeRunId("some-Run-Name"), "some-Run-Name");
 });
@@ -60,6 +72,8 @@ test("outcomes file: bad lines are refused with their line number, never their v
   // The run id is a value from the user's file: never echoed.
   refuse(`{"run": "SECRET", "pass": true}\n{"run": "SECRET", "pass": false}`, /line 2: this run is listed as both pass and fail \(also on line 1\)$/);
   refuse(`\n\n`, /no outcomes in the file/);
+  // A byte order mark at the start of the file is not part of the first line.
+  assert.equal(readOutcomes(tmpFile("o.jsonl", `\uFEFF${ok}\n`)).rows.get(EXPLAIN[0]!), true);
   // The same outcome twice is fine (files get concatenated).
   assert.equal(readOutcomes(tmpFile("o.jsonl", `${ok}\n${ok}\n`)).rows.size, 1);
 });
@@ -219,7 +233,9 @@ test("diff: nothing moved is no change, not too few runs; the table shows passes
   assert.equal(successVerdictLine(r), "no change");
   const t = renderDiffTable(r, { width: 200 });
   assert.match(t, /success +100\.0% → 100\.0% +no change/);
-  assert.match(t, /passed 3\/3 → 3\/3 · per success \$1\.00 → \$1\.00/);
+  assert.match(t, /passed 3\/3 → 3\/3\n/);
+  assert.match(t, /per success +\$1\.00 → \$1\.00 +no change/);
+  assert.equal(r.success!.costPerSuccess.verdict, "no clear change");
   assert.match(t, /cache +passed/);
 });
 
@@ -370,4 +386,151 @@ test("--group-by keeps a label whose name looks like content when the user names
 test("fixture outcomes are the bench's grades for the committed traces", () => {
   const rows = readFileSync(fixture("openai-agents-outcomes.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
   assert.deepEqual(rows.map((r) => [r.run, r.pass]), [...EXPLAIN.map((id) => [id, true]), [CUT_OFF, false]]);
+});
+
+test("traces whose ids share a prefix (time-ordered ids) stay separate runs and keep their own outcomes", () => {
+  const a = "019a7c3e5f10" + "7a1b2c3d4e5f60718293";
+  const b = "019a7c3e5f10" + "8f9e8d7c6b5a49382716";
+  const call = (trace: string, id: string) =>
+    span({ trace, id, name: "chat", start: 0, attrs: { "gen_ai.operation.name": "chat", "gen_ai.request.model": "claude-sonnet-5-5", "gen_ai.usage.input_tokens": 1000, "gen_ai.usage.output_tokens": 100 } });
+  const file = tmpFile("prefix.json", JSON.stringify(otlp([call(a, "1"), call(b, "2")])));
+  const outcomes: Outcomes = { file: "o.jsonl", rows: new Map([[a, true], [b, false]]) };
+  const r = audit([file], { outcomes });
+  assert.equal(r.runs.length, 2);
+  assert.equal(r.perRun!.count, 2);
+  assert.equal(r.outcomes!.known, 2);
+  assert.equal(r.outcomes!.passed, 1);
+  assert.equal(r.outcomes!.unmatchedRows, 0);
+});
+
+test("diff: a head whose every run failed before a priced call fails the success gate (exit 1), not just exit 2", () => {
+  const trace = (i: number, side: number) => `${side}${i}`.padStart(32, "a");
+  const call = (side: number, i: number) => {
+    const s = span({
+      trace: trace(i, side),
+      id: "1",
+      name: "chat",
+      start: 0,
+      attrs: {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.agent.name": "reviewer",
+        "gen_ai.request.model": "claude-sonnet-5-5",
+        ...(side === 1 ? { "gen_ai.usage.input_tokens": 1000, "gen_ai.usage.output_tokens": 100 } : {}),
+      },
+    });
+    return side === 1 ? s : { ...s, status: { code: 2 } };
+  };
+  const ids = [0, 1, 2, 3];
+  const base = tmpFile("base.json", JSON.stringify(otlp(ids.map((i) => call(1, i)))));
+  const head = tmpFile("head.json", JSON.stringify(otlp(ids.map((i) => call(2, i)))));
+  const outcomes = tmpFile(
+    "o.jsonl",
+    jsonl([...ids.map((i) => ({ run: trace(i, 1), pass: true })), ...ids.map((i) => ({ run: trace(i, 2), pass: false }))]),
+  );
+  const r = run("diff", base, head, "--outcomes", outcomes, "--fail-success-drop", "10");
+  // 4 of 4 -> 0 of 4: one-sided p = 1/C(8,4) = 1/70.
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /no priced runs in head .*cost not compared/);
+  assert.match(r.stderr, /success fell 100\.0 points \(4\/4 -> 0\/4 passed\)/);
+  assert.match(r.stdout, /reviewer\s+base\s+4(\s+–){8}\s+4\/4/);
+  assert.match(r.stdout, /head\s+4(\s+–){8}\s+0\/4/);
+  assert.match(r.stdout, /priced runs only in base, cost not compared: reviewer \(success compared\)/);
+  assert.doesNotMatch(r.stdout, /models:/);
+  // Without the success gate, nothing was compared: 2.
+  assert.equal(run("diff", base, head, "--outcomes", outcomes).status, 2);
+});
+
+// --- cost per success in diff ------------------------------------------------------
+
+/** k-subsets of 0..n-1, written out again here so the check doesn't share code with diff.ts. */
+const subsets = (n: number, k: number): number[][] =>
+  k === 0 ? [[]] : n < k ? [] : [...subsets(n - 1, k - 1).map((s) => [...s, n - 1]), ...subsets(n - 1, k)];
+
+test("diff: cost per success p-value equals a brute-force count over every relabeling (2 groups x 5 v 5)", () => {
+  const spec = {
+    a: { base: [[1.0, true], [1.1, true], [0.9, true], [1.2, false], [1.0, true]], head: [[1.5, true], [1.6, false], [1.7, true], [1.5, false], [1.6, true]] },
+    b: { base: [[2.0, true], [2.2, true], [1.8, true], [2.1, true], [1.9, false]], head: [[2.8, true], [3.0, false], [2.9, true], [3.1, true], [2.7, false]] },
+  } as const;
+  const base = Object.entries(spec).flatMap(([t, g]) => g.base.map(([c, p]) => unit(t, p, c)));
+  const head = Object.entries(spec).flatMap(([t, g]) => g.head.map(([c, p]) => unit(t, p, c)));
+  const r = diffOf(base, head);
+  const cps = r.success!.costPerSuccess;
+
+  // Independently: cost per success at base's mix (equal weights) for any labeling.
+  type R = readonly [number, boolean];
+  const perSuccess = (a: readonly R[], b: readonly R[]) => {
+    const m = (xs: readonly R[], f: (x: R) => number) => xs.reduce((s, x) => s + f(x), 0) / xs.length;
+    const spend = 0.5 * m(a, (x) => x[0]) + 0.5 * m(b, (x) => x[0]);
+    const passed = 0.5 * m(a, (x) => (x[1] ? 1 : 0)) + 0.5 * m(b, (x) => (x[1] ? 1 : 0));
+    return spend / passed;
+  };
+  const obs = perSuccess(spec.a.head, spec.b.head) / perSuccess(spec.a.base, spec.b.base);
+  close(cps.baseUsd!, perSuccess(spec.a.base, spec.b.base));
+  close(cps.headUsd!, perSuccess(spec.a.head, spec.b.head));
+  close(cps.change!, obs - 1);
+
+  const poolA: R[] = [...spec.a.base, ...spec.a.head];
+  const poolB: R[] = [...spec.b.base, ...spec.b.head];
+  const split = (pool: R[], pick: number[]) => [pick.map((i) => pool[i]!), pool.filter((_, i) => !pick.includes(i))] as const;
+  let higher = 0;
+  let either = 0;
+  let total = 0;
+  for (const pa of subsets(10, 5))
+    for (const pb of subsets(10, 5)) {
+      const [ha, ba] = split(poolA, pa);
+      const [hb, bb] = split(poolB, pb);
+      const ratio = perSuccess(ha, hb) / perSuccess(ba, bb);
+      total++;
+      if (ratio >= obs * (1 - 1e-9)) higher++;
+      if (Math.abs(Math.log(ratio)) >= Math.abs(Math.log(obs)) * (1 - 1e-9)) either++;
+    }
+  assert.equal(cps.method, "exact");
+  assert.equal(cps.permutations, total);
+  close(cps.pHigher, higher / total);
+  close(cps.pTwoSided, either / total);
+  assert.ok(cps.pTwoSided < 0.05, `${cps.pTwoSided}`);
+  assert.equal(cps.verdict, "higher");
+  // p is just under 0.05 here: shown with three decimals, never as a misleading "p=0.05".
+  assert.match(costPerSuccessLine(r), /^higher, \+96% \(p=0\.04\d\)$/);
+});
+
+test("diff: one group of 3 v 3 can't show cost per success doubling: too few runs", () => {
+  const r = diffOf(passes("a", true, true, true), [true, true, true].map((p) => unit("a", p, 2)));
+  const cps = r.success!.costPerSuccess;
+  close(cps.change!, 1);
+  // Head holding the three $2 runs, or base holding them: 2 of C(6,3) = 20.
+  close(cps.pTwoSided, 2 / 20);
+  close(cps.minP, 2 / 20);
+  assert.equal(cps.verdict, "too few runs");
+});
+
+test("diff: a head with no passes is an infinite cost per success; six inputs flipping show it", () => {
+  const inputs = ["i1", "i2", "i3", "i4", "i5", "i6"];
+  const r = diffOf(inputs.map((i) => unit(i, true)), inputs.map((i) => unit(i, false)));
+  const cps = r.success!.costPerSuccess;
+  assert.equal(cps.headUsd, null);
+  assert.equal(cps.change, null);
+  // Only the observed labeling and its mirror image have a side with no passes: 2 of 2^6.
+  close(cps.pTwoSided, 2 / 64);
+  assert.equal(cps.verdict, "higher");
+  assert.match(costPerSuccessLine(r), /^higher, head has no passes \(p=/);
+  assert.match(renderDiffTable(r, { width: 200 }), /per success +\$1\.00 → no passes +higher/);
+});
+
+test("diff: cost per success is can't tell with unknown spend or a missing outcome, a lower bound with a failed call", () => {
+  const partly = unit("a", true, 1, { pricedCalls: 3 });
+  const r1 = diffOf(passes("a", true, true, true), [...passes("a", true, true), partly]);
+  assert.equal(r1.success!.costPerSuccess.verdict, "can't tell");
+  assert.match(costPerSuccessLine(r1), /no price or no usage/);
+
+  const r2 = diffOf([...passes("a", true, true), unit("a", undefined)], passes("a", true, true, true));
+  assert.equal(r2.success!.costPerSuccess.verdict, "can't tell");
+  assert.match(costPerSuccessLine(r2), /compared runs with no outcome/);
+
+  const dead = unit("a", false, 0, { pricedCalls: 0, failedCalls: 1, calls: 1 });
+  const r3 = diffOf(passes("a", true, true, true), [...passes("a", true, true), dead]);
+  const cps = r3.success!.costPerSuccess;
+  assert.equal(cps.lowerBound, true);
+  assert.notEqual(cps.verdict, "can't tell");
+  assert.match(renderDiffTable(r3, { width: 200 }), /lower bound: some runs had a failed call/);
 });
