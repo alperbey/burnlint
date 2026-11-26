@@ -1,0 +1,12 @@
+{
+  "name": "burnlint",
+  "description": "burnlint: measure what agent runs cost and catch cost regressions",
+  "owner": { "name": "alperbey", "url": "https://github.com/alperbey" },
+  "plugins": [
+    {
+      "name": "burnlint",
+      "source": "./",
+      "description": "Skill that runs burnlint (npx) to explain agent and Claude Code session costs, compare before/after, and gate cost in CI"
+    }
+  ]
+}

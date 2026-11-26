@@ -43,6 +43,28 @@ npx burnlint diff base.jsonl head.jsonl --fail-above 15  # did this change make 
 npx burnlint diff base/ head/ --outcomes outcomes.jsonl  # ...and do they still pass?
 ```
 
+## Use it from your coding agent
+
+burnlint ships an agent skill, so Claude Code, Codex and other agents know when to run it and how to read its output. The skill runs the CLI with `npx burnlint`; nothing else is installed.
+
+Claude Code, as a plugin:
+
+```
+/plugin marketplace add alperbey/burnlint
+/plugin install burnlint@burnlint
+```
+
+(On Claude Code 2.1.275 or later, `/plugin install burnlint --marketplace alperbey/burnlint` does both.)
+
+Codex, or any agent that reads skills from `~/.agents/skills`:
+
+```
+mkdir -p ~/.agents/skills/burnlint
+curl -fsSL https://raw.githubusercontent.com/alperbey/burnlint/main/skills/burnlint/SKILL.md -o ~/.agents/skills/burnlint/SKILL.md
+```
+
+Then ask in your own words: "why did this session cost so much?", "did my prompt change make runs more expensive?"
+
 ## Example
 
 From a real Claude Code session (project name and session id replaced):

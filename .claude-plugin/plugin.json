@@ -1,0 +1,9 @@
+{
+  "name": "burnlint",
+  "description": "Catch agent cost regressions before they ship: cost per run, before/after with a significance test, cost per successful run, and avoidable spend, from Claude Code logs and OpenTelemetry traces.",
+  "author": { "name": "alperbey", "url": "https://github.com/alperbey" },
+  "homepage": "https://github.com/alperbey/burnlint",
+  "repository": "https://github.com/alperbey/burnlint",
+  "license": "MIT",
+  "keywords": ["agent-cost", "cost-regression", "llm-cost", "claude-code", "opentelemetry", "prompt-caching"]
+}
